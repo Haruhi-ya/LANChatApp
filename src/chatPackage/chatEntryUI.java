@@ -7,13 +7,17 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.geom.RoundRectangle2D;
 import java.io.IOException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 public class chatEntryUI extends JFrame {
 
-    private JTextField nicknameField;
+    private JTextField usernameField;
+    private JPasswordField passwordField;
     private JTextField ipField;
     private JTextField portField;
-    private JButton enterButton;
+    private JButton loginButton;
+    private JButton registerButton;
     private JButton cancelButton;
 
     private static final Color PRIMARY = new Color(99, 132, 255);
@@ -24,6 +28,9 @@ public class chatEntryUI extends JFrame {
     private static final Color TEXT_GRAY = new Color(140, 149, 168);
     private static final Color CANCEL_BG = new Color(235, 238, 245);
     private static final Color CANCEL_HOVER = new Color(220, 224, 235);
+
+    /** 等待服务器登录/注册响应的超时时间 */
+    private static final int RESPONSE_TIMEOUT_SECONDS = 5;
 
     public chatEntryUI() {
         initUI();
@@ -78,7 +85,7 @@ public class chatEntryUI extends JFrame {
         gbc.anchor = GridBagConstraints.CENTER;
         card.add(titleLabel, gbc);
 
-        JLabel subtitleLabel = new JLabel("请输入连接信息，开始畅聊吧");
+        JLabel subtitleLabel = new JLabel("输入账号登录，或注册新账号开始畅聊");
         subtitleLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
         subtitleLabel.setForeground(TEXT_GRAY);
         subtitleLabel.setHorizontalAlignment(SwingConstants.CENTER);
@@ -102,8 +109,8 @@ public class chatEntryUI extends JFrame {
         gbc.insets = new Insets(0, 0, 20, 0);
         card.add(sep, gbc);
 
-        // 昵称标签
-        JLabel nameLabel = new JLabel("昵称");
+        // 用户名标签
+        JLabel nameLabel = new JLabel("用户名");
         nameLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 13));
         nameLabel.setForeground(TEXT_DARK);
         gbc.gridy = 3;
@@ -113,37 +120,60 @@ public class chatEntryUI extends JFrame {
         gbc.insets = new Insets(0, 0, 8, 0);
         card.add(nameLabel, gbc);
 
-        // 昵称输入框
-        nicknameField = createStyledTextField("请输入您的昵称");
+        // 用户名输入框
+        usernameField = createStyledTextField("请输入用户名");
         gbc.gridy = 4;
-        gbc.insets = new Insets(0, 0, 20, 0);
-        card.add(nicknameField, gbc);
+        gbc.insets = new Insets(0, 0, 16, 0);
+        card.add(usernameField, gbc);
+
+        // 密码标签
+        JLabel passwordLabel = new JLabel("密码");
+        passwordLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 13));
+        passwordLabel.setForeground(TEXT_DARK);
+        gbc.gridy = 5;
+        gbc.insets = new Insets(0, 0, 8, 0);
+        card.add(passwordLabel, gbc);
+
+        // 密码输入框
+        passwordField = new JPasswordField(20);
+        passwordField.setFont(new Font("Microsoft YaHei", Font.PLAIN, 14));
+        passwordField.setForeground(TEXT_DARK);
+        passwordField.setCaretColor(PRIMARY);
+        passwordField.setBackground(BG_LIGHT);
+        passwordField.setEchoChar('●');
+        passwordField.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(new Color(210, 215, 230), 1, true),
+                BorderFactory.createEmptyBorder(10, 14, 10, 14)
+        ));
+        gbc.gridy = 6;
+        gbc.insets = new Insets(0, 0, 16, 0);
+        card.add(passwordField, gbc);
 
         // IP地址标签
         JLabel ipLabel = new JLabel("服务器IP地址");
         ipLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 13));
         ipLabel.setForeground(TEXT_DARK);
-        gbc.gridy = 5;
+        gbc.gridy = 7;
         gbc.insets = new Insets(0, 0, 8, 0);
         card.add(ipLabel, gbc);
 
         // IP地址输入框
         ipField = createStyledTextField("例如：192.168.1.100");
-        gbc.gridy = 6;
-        gbc.insets = new Insets(0, 0, 20, 0);
+        gbc.gridy = 8;
+        gbc.insets = new Insets(0, 0, 16, 0);
         card.add(ipField, gbc);
 
         // 端口标签
         JLabel portLabel = new JLabel("端口号");
         portLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 13));
         portLabel.setForeground(TEXT_DARK);
-        gbc.gridy = 7;
+        gbc.gridy = 9;
         gbc.insets = new Insets(0, 0, 8, 0);
         card.add(portLabel, gbc);
 
         // 端口输入框
         portField = createStyledTextField("例如：8080");
-        gbc.gridy = 8;
+        gbc.gridy = 10;
         gbc.insets = new Insets(0, 0, 25, 0);
         card.add(portField, gbc);
 
@@ -151,13 +181,15 @@ public class chatEntryUI extends JFrame {
         JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 12, 0));
         buttonPanel.setOpaque(false);
 
-        enterButton = createStyledButton("进入聊天", PRIMARY, Color.WHITE, PRIMARY_HOVER);
+        loginButton = createStyledButton("登录", PRIMARY, Color.WHITE, PRIMARY_HOVER);
+        registerButton = createStyledButton("注册", CANCEL_BG, TEXT_DARK, CANCEL_HOVER);
         cancelButton = createStyledButton("取消", CANCEL_BG, TEXT_DARK, CANCEL_HOVER);
 
-        buttonPanel.add(enterButton);
+        buttonPanel.add(loginButton);
+        buttonPanel.add(registerButton);
         buttonPanel.add(cancelButton);
 
-        gbc.gridy = 9;
+        gbc.gridy = 11;
         gbc.gridwidth = 2;
         gbc.anchor = GridBagConstraints.CENTER;
         gbc.fill = GridBagConstraints.NONE;
@@ -167,12 +199,14 @@ public class chatEntryUI extends JFrame {
         wrapper.add(card);
         add(wrapper);
 
-        enterButton.addActionListener(e -> onEnter());
+        loginButton.addActionListener(e -> onLogin());
+        registerButton.addActionListener(e -> onRegister());
         cancelButton.addActionListener(e -> onCancel());
-        nicknameField.addActionListener(e -> ipField.requestFocusInWindow());
+        usernameField.addActionListener(e -> passwordField.requestFocusInWindow());
+        passwordField.addActionListener(e -> onLogin());
         ipField.addActionListener(e -> portField.requestFocusInWindow());
-        portField.addActionListener(e -> onEnter());
-        getRootPane().setDefaultButton(enterButton);
+        portField.addActionListener(e -> onLogin());
+        getRootPane().setDefaultButton(loginButton);
 
         pack();
         setLocationRelativeTo(null);
@@ -249,7 +283,7 @@ public class chatEntryUI extends JFrame {
         button.setBorderPainted(false);
         button.setFocusPainted(false);
         button.setCursor(new Cursor(Cursor.HAND_CURSOR));
-        button.setPreferredSize(new Dimension(130, 42));
+        button.setPreferredSize(new Dimension(100, 42));
         button.setOpaque(false);
 
         button.addMouseListener(new MouseAdapter() {
@@ -262,13 +296,17 @@ public class chatEntryUI extends JFrame {
         return button;
     }
 
-    public String getNickname() {
-        String nickname = nicknameField.getText().trim();
+    public String getUsername() {
+        String username = usernameField.getText().trim();
         // 如果还是占位符文本，返回空字符串
-        if (nickname.equals("请输入您的昵称")) {
+        if (username.equals("请输入用户名")) {
             return "";
         }
-        return nickname;
+        return username;
+    }
+
+    public String getPassword() {
+        return new String(passwordField.getPassword()).trim();
     }
 
     public String getServerIP() {
@@ -287,55 +325,67 @@ public class chatEntryUI extends JFrame {
         return port;
     }
 
-    private void onEnter() {
-        String nickname = getNickname();
+    private void onLogin() {
+        String username = getUsername();
+        String password = getPassword();
         String ip = getServerIP();
         String port = getPort();
 
-        // 验证昵称
-        if (nickname.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "请输入昵称", "提示",
-                    JOptionPane.WARNING_MESSAGE);
-            nicknameField.requestFocusInWindow();
+        if (!validateInputs(username, password, ip, port)) {
             return;
         }
+        int portNum = Integer.parseInt(port);
+        connectAndSubmit("登录", username, password, ip, portNum, true);
+    }
 
-        // 昵称不能包含协议保留字符（冒号分隔昵称与内容，逗号分隔用户列表）
-        if (nickname.contains(":") || nickname.contains(",")) {
-            JOptionPane.showMessageDialog(this, "昵称不能包含冒号（:）或逗号（,）", "提示",
-                    JOptionPane.WARNING_MESSAGE);
-            nicknameField.requestFocusInWindow();
+    private void onRegister() {
+        String username = getUsername();
+        String password = getPassword();
+        String ip = getServerIP();
+        String port = getPort();
+
+        if (!validateInputs(username, password, ip, port)) {
             return;
         }
+        int portNum = Integer.parseInt(port);
+        connectAndSubmit("注册", username, password, ip, portNum, false);
+    }
 
-        // 验证IP地址
+    /** 表单校验，不通过时弹窗提示并返回 false */
+    private boolean validateInputs(String username, String password, String ip, String port) {
+        if (username.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "请输入用户名", "提示", JOptionPane.WARNING_MESSAGE);
+            usernameField.requestFocusInWindow();
+            return false;
+        }
+        if (username.contains(":") || username.contains(",")) {
+            JOptionPane.showMessageDialog(this, "用户名不能包含冒号（:）或逗号（,）", "提示",
+                    JOptionPane.WARNING_MESSAGE);
+            usernameField.requestFocusInWindow();
+            return false;
+        }
+        if (password.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "请输入密码", "提示", JOptionPane.WARNING_MESSAGE);
+            passwordField.requestFocusInWindow();
+            return false;
+        }
         if (ip.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "请输入服务器IP地址", "提示",
-                    JOptionPane.WARNING_MESSAGE);
+            JOptionPane.showMessageDialog(this, "请输入服务器IP地址", "提示", JOptionPane.WARNING_MESSAGE);
             ipField.requestFocusInWindow();
-            return;
+            return false;
         }
-
-        // 验证IP格式
         if (!isValidIP(ip)) {
-            JOptionPane.showMessageDialog(this, "请输入有效的IP地址格式", "提示",
-                    JOptionPane.WARNING_MESSAGE);
+            JOptionPane.showMessageDialog(this, "请输入有效的IP地址格式", "提示", JOptionPane.WARNING_MESSAGE);
             ipField.requestFocusInWindow();
-            return;
+            return false;
         }
-
-        // 验证端口
         if (port.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "请输入端口号", "提示",
-                    JOptionPane.WARNING_MESSAGE);
+            JOptionPane.showMessageDialog(this, "请输入端口号", "提示", JOptionPane.WARNING_MESSAGE);
             portField.requestFocusInWindow();
-            return;
+            return false;
         }
-
-        // 验证端口格式和范围
-        int portNum;
         try {
-            portNum = Integer.parseInt(port);
+            int portNum = Integer.parseInt(port);
             if (portNum < 1 || portNum > 65535) {
                 throw new NumberFormatException();
             }
@@ -343,32 +393,94 @@ public class chatEntryUI extends JFrame {
             JOptionPane.showMessageDialog(this, "请输入有效的端口号（1-65535）", "提示",
                     JOptionPane.WARNING_MESSAGE);
             portField.requestFocusInWindow();
-            return;
+            return false;
         }
+        return true;
+    }
 
-        // 在后台线程连接服务器，避免网络耗时阻塞界面（连接失败可留在登录页重新填写）
-        enterButton.setEnabled(false);
+    /**
+     * 后台线程连接服务器并提交登录/注册请求，等待服务端结果：
+     *  - 登录成功：打开聊天窗口
+     *  - 注册成功：提示后留在登录页
+     *  - 失败：弹窗提示并恢复表单
+     */
+    private void connectAndSubmit(String action, String username, String password,
+                                  String ip, int portNum, boolean isLogin) {
+        loginButton.setEnabled(false);
+        registerButton.setEnabled(false);
         setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
+
         new Thread(() -> {
+            chatClient client = new chatClient();
+            final CountDownLatch latch = new CountDownLatch(1);
+            final boolean[] success = {false};
+            final String[] reason = {""};
+
+            // 临时监听器：收集登录/注册结果，结果到达后放行等待
+            client.setListener(new chatClient.Listener() {
+                @Override
+                public void onLoginResult(boolean ok, String r) { success[0] = ok; reason[0] = r; latch.countDown(); }
+                @Override
+                public void onRegisterResult(boolean ok, String r) { success[0] = ok; reason[0] = r; latch.countDown(); }
+                @Override
+                public void onDisconnected(String r) { reason[0] = r; latch.countDown(); }
+                @Override
+                public void onSystemMessage(String c) {}
+                @Override
+                public void onChatMessage(String s, String c) {}
+                @Override
+                public void onUserList(String[] u) {}
+                @Override
+                public void onOfflineUsers(String[] u) {}
+            });
+
             try {
-                chatClient client = new chatClient();
                 client.connect(ip, portNum);
-                // 连接成功后回到 EDT 创建聊天窗口（登录动作在聊天窗口内部完成）
+                if (isLogin) {
+                    client.login(username, password);
+                } else {
+                    client.register(username, password);
+                }
+
+                // 等待服务端返回结果，超时视为失败
+                if (!latch.await(RESPONSE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    throw new IOException("服务器响应超时，请检查服务器是否正常运行");
+                }
+                if (!success[0]) {
+                    throw new IOException(reason[0]);
+                }
+
+                // 注册成功后连接不再需要，关闭
+                if (!isLogin) {
+                    client.logout();
+                }
+                final chatClient connected = client;
                 SwingUtilities.invokeLater(() -> {
-                    new clientChatUI(nickname, ip, portNum, client).setVisible(true);
-                    dispose();
+                    if (isLogin) {
+                        // 登录成功，打开聊天窗口（窗口构造时会注册正式的消息监听器）
+                        new clientChatUI(username, ip, portNum, connected).setVisible(true);
+                        dispose();
+                    } else {
+                        JOptionPane.showMessageDialog(this, "注册成功，请登录", "提示",
+                                JOptionPane.INFORMATION_MESSAGE);
+                        resetButtons();
+                    }
                 });
-            } catch (IOException e) {
+            } catch (Exception e) {
+                client.logout();
                 SwingUtilities.invokeLater(() -> {
-                    JOptionPane.showMessageDialog(this,
-                            "无法连接到服务器 " + ip + ":" + portNum + "\n" + e.getMessage(),
-                            "连接失败",
-                            JOptionPane.ERROR_MESSAGE);
-                    enterButton.setEnabled(true);
-                    setCursor(Cursor.getDefaultCursor());
+                    JOptionPane.showMessageDialog(this, action + "失败：" + e.getMessage(),
+                            action + "失败", JOptionPane.ERROR_MESSAGE);
+                    resetButtons();
                 });
             }
         }, "connect-server").start();
+    }
+
+    private void resetButtons() {
+        loginButton.setEnabled(true);
+        registerButton.setEnabled(true);
+        setCursor(Cursor.getDefaultCursor());
     }
 
     private boolean isValidIP(String ip) {

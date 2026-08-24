@@ -4,6 +4,9 @@ out/
 !**/src/test/**/out/
 .kotlin
 
+### 数据库配置（含真实密码，禁止提交） ###
+config.properties
+
 ### Eclipse ###
 .apt_generated
 .classpath

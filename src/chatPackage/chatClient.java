@@ -28,9 +28,12 @@ public class chatClient {
 
     /** 服务器消息回调接口（由 UI 层实现） */
     public interface Listener {
+        void onLoginResult(boolean success, String reason);   // LOGINOK / LOGINFAIL:原因
+        void onRegisterResult(boolean success, String reason); // REGISTEROK / REGISTERFAIL:原因
         void onSystemMessage(String content);          // SYSTEM:xxx 系统消息
         void onChatMessage(String sender, String content); // MSG:昵称:内容 聊天消息
         void onUserList(String[] users);               // USERS:... 在线用户列表
+        void onOfflineUsers(String[] users);           // OFFLINEUSERS:... 离线用户列表
         void onDisconnected(String reason);            // 连接断开（异常/被服务器关闭/主动退出）
     }
 
@@ -65,9 +68,14 @@ public class chatClient {
         this.listener = listener;
     }
 
-    /** 登录（应放在注册监听器之后调用） */
-    public void login(String nickname) {
-        sendLine("LOGIN:" + nickname);
+    /** 登录（应放在注册监听器之后调用），结果通过 onLoginResult 回调通知 */
+    public void login(String username, String password) {
+        sendLine("LOGIN:" + username + ":" + password);
+    }
+
+    /** 注册新账号，结果通过 onRegisterResult 回调通知 */
+    public void register(String username, String password) {
+        sendLine("REGISTER:" + username + ":" + password);
     }
 
     /** 发送一条聊天消息 */
@@ -118,7 +126,15 @@ public class chatClient {
         if (listener == null) {
             return;
         }
-        if (line.startsWith("SYSTEM:")) {
+        if (line.equals("LOGINOK")) {
+            listener.onLoginResult(true, "");
+        } else if (line.startsWith("LOGINFAIL:")) {
+            listener.onLoginResult(false, line.substring("LOGINFAIL:".length()));
+        } else if (line.equals("REGISTEROK")) {
+            listener.onRegisterResult(true, "");
+        } else if (line.startsWith("REGISTERFAIL:")) {
+            listener.onRegisterResult(false, line.substring("REGISTERFAIL:".length()));
+        } else if (line.startsWith("SYSTEM:")) {
             listener.onSystemMessage(line.substring("SYSTEM:".length()));
         } else if (line.startsWith("MSG:")) {
             // MSG:昵称:内容 —— 取第一个冒号做分隔符，消息内容本身可以含冒号
@@ -133,6 +149,10 @@ public class chatClient {
             String list = line.substring("USERS:".length());
             String[] users = list.isEmpty() ? new String[0] : list.split(",");
             listener.onUserList(users);
+        } else if (line.startsWith("OFFLINEUSERS:")) {
+            String list = line.substring("OFFLINEUSERS:".length());
+            String[] users = list.isEmpty() ? new String[0] : list.split(",");
+            listener.onOfflineUsers(users);
         }
     }
 

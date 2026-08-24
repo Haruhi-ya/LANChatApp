@@ -1,0 +1,6 @@
+# 数据库配置模板：复制本文件为 config.properties 并填入真实密码
+# 注意：config.properties 已被 .gitignore 忽略，真实密码不会提交到仓库
+db.host=localhost
+db.port=3306
+db.user=root
+db.password=你的MySQL密码

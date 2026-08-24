@@ -19,7 +19,6 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     private JTextField inputField;
     private JButton sendButton;
     private JButton emojiButton;
-    private JButton fileButton;
     private JPanel onlineUsersPanel;
     private JLabel connectionStatusLabel;
     private JLabel userCountLabel;
@@ -36,10 +35,14 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     // 样式名序号：保证每次插入消息都使用全新的样式对象
     private int styleSeq;
 
-    // 在线用户列表
-    private DefaultListModel<String> onlineUsersModel;
-    private JList<String> onlineUsersList;
+    // 用户列表（在线 + 离线合并显示）
+    private DefaultListModel<UserEntry> userListModel;
+    private JList<UserEntry> userList;
     private Map<String, Color> userColors = new ConcurrentHashMap<>();
+
+    // 在线/离线用户集合（由服务端广播更新，合并显示时在线用户排前面）
+    private final Set<String> onlineUsers = new LinkedHashSet<>();
+    private final Set<String> offlineUsers = new LinkedHashSet<>();
 
     // 颜色定义
     private static final Color PRIMARY = new Color(99, 132, 255);
@@ -69,10 +72,9 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         this.serverPort = serverPort;
         this.client = client;
         // 注册消息回调（回调发生在接收线程，实现里统一用 invokeLater 切回 EDT 更新界面）
+        // 注意：登录验证已在登录界面完成，这里只接管消息渲染，不能再调用 login()
         client.setListener(this);
         initUI();
-        // UI 就绪后再登录，确保服务端广播的欢迎/用户列表消息不会丢失
-        client.login(nickname);
         appendSystemMessage("欢迎 " + nickname + " 加入聊天室！");
         appendSystemMessage("您已连接到服务器 " + serverIP + ":" + serverPort);
     }
@@ -207,23 +209,20 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
 
         usersPanel.add(headerPanel, BorderLayout.NORTH);
 
-        // 在线用户列表
-        onlineUsersModel = new DefaultListModel<>();
-        onlineUsersList = new JList<>(onlineUsersModel);
-        onlineUsersList.setBackground(SIDEBAR_BG);
-        onlineUsersList.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
-        onlineUsersList.setForeground(TEXT_DARK);
-        onlineUsersList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        onlineUsersList.setCellRenderer(new UserListCellRenderer());
-        onlineUsersList.setFixedCellHeight(40);
+        // 用户列表（登录后由服务端广播的在线/离线用户数据填充）
+        userListModel = new DefaultListModel<>();
+        userList = new JList<>(userListModel);
+        userList.setBackground(SIDEBAR_BG);
+        userList.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
+        userList.setForeground(TEXT_DARK);
+        userList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        userList.setCellRenderer(new UserListCellRenderer());
+        userList.setFixedCellHeight(40);
 
-        JScrollPane usersScrollPane = new JScrollPane(onlineUsersList);
+        JScrollPane usersScrollPane = new JScrollPane(userList);
         usersScrollPane.setBorder(null);
         usersScrollPane.setBackground(SIDEBAR_BG);
         usersPanel.add(usersScrollPane, BorderLayout.CENTER);
-
-        // 添加当前用户到在线列表
-        onlineUsersModel.addElement(nickname);
 
         return usersPanel;
     }
@@ -243,10 +242,6 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         emojiButton = createIconButton("😊", "表情");
         emojiButton.addActionListener(e -> showEmojiPopup());
         buttonGroup.add(emojiButton);
-
-        fileButton = createIconButton("📎", "发送文件");
-        fileButton.addActionListener(e -> sendFile());
-        buttonGroup.add(fileButton);
 
         inputPanel.add(buttonGroup, BorderLayout.WEST);
 
@@ -318,17 +313,6 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         emojiPopup.show(emojiButton, 0, emojiButton.getHeight());
     }
 
-    private void sendFile() {
-        JFileChooser fileChooser = new JFileChooser();
-        fileChooser.setDialogTitle("选择要发送的文件");
-        int result = fileChooser.showOpenDialog(this);
-        if (result == JFileChooser.APPROVE_OPTION) {
-            // 文件传输涉及额外的二进制传输协议，暂未实现
-            JOptionPane.showMessageDialog(this, "文件传输功能开发中，敬请期待",
-                    "提示", JOptionPane.INFORMATION_MESSAGE);
-        }
-    }
-
     private void sendMessage() {
         String message = inputField.getText().trim();
         if (!message.isEmpty()) {
@@ -383,12 +367,17 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         }
     }
 
+    // 用户专属颜色调色板：色相均匀分布的 16 种高区分度颜色。
+    // 旧实现用 hashCode % 360 当色相，相近昵称的 hash 只差 1，颜色几乎一样，
+    // 视觉上就像所有用户都被硬编码成了同一种颜色。
+    private static final int USER_COLOR_COUNT = 16;
+
     private Color getColorForUser(String username) {
         if (!userColors.containsKey(username)) {
-            // 生成稳定的用户颜色
-            int hash = username.hashCode();
-            float hue = Math.abs(hash % 360) / 360.0f;
-            Color color = Color.getHSBColor(hue, 0.6f, 0.8f);
+            // 按用户名哈希稳定分配调色板颜色，同一用户颜色永远不变
+            int index = Math.floorMod(username.hashCode(), USER_COLOR_COUNT);
+            float hue = index * (360.0f / USER_COLOR_COUNT);
+            Color color = Color.getHSBColor(hue / 360.0f, 0.7f, 0.85f);
             userColors.put(username, color);
         }
         return userColors.get(username);
@@ -471,8 +460,19 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         return button;
     }
 
-    // 用户列表自定义渲染器
-    private class UserListCellRenderer extends JPanel implements ListCellRenderer<String> {
+    /** 用户列表条目：用户名 + 在线状态 */
+    private static class UserEntry {
+        final String name;
+        final boolean online;
+
+        UserEntry(String name, boolean online) {
+            this.name = name;
+            this.online = online;
+        }
+    }
+
+    // 用户列表自定义渲染器（在线绿色状态点，离线灰色状态点和灰显名字）
+    private class UserListCellRenderer extends JPanel implements ListCellRenderer<UserEntry> {
         private JLabel avatarLabel;
         private JLabel nameLabel;
         private JLabel statusLabel;
@@ -509,12 +509,15 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         }
 
         @Override
-        public Component getListCellRendererComponent(JList<? extends String> list, String value,
+        public Component getListCellRendererComponent(JList<? extends UserEntry> list, UserEntry value,
                                                       int index, boolean isSelected, boolean cellHasFocus) {
             if (value != null) {
-                avatarLabel.setText(value.substring(0, 1).toUpperCase());
-                avatarLabel.setBackground(getColorForUser(value));
-                nameLabel.setText(value);
+                avatarLabel.setText(value.name.substring(0, 1).toUpperCase());
+                avatarLabel.setBackground(getColorForUser(value.name));
+                nameLabel.setText(value.name);
+                // 在线用户绿色状态点 + 深色名字；离线用户灰色状态点 + 灰显名字
+                statusLabel.setForeground(value.online ? ONLINE_GREEN : new Color(170, 175, 190));
+                nameLabel.setForeground(value.online ? TEXT_DARK : new Color(160, 165, 180));
             }
 
             if (isSelected) {
@@ -543,8 +546,20 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         }
     }
 
+    /** 按在线优先的顺序重建合并用户列表 */
+    private void refreshUserList() {
+        userListModel.clear();
+        for (String user : onlineUsers) {
+            userListModel.addElement(new UserEntry(user, true));
+        }
+        for (String user : offlineUsers) {
+            userListModel.addElement(new UserEntry(user, false));
+        }
+        updateUserCount();
+    }
+
     private void updateUserCount() {
-        userCountLabel.setText(onlineUsersModel.size() + "人在线");
+        userCountLabel.setText(onlineUsers.size() + "人在线 · 共" + (onlineUsers.size() + offlineUsers.size()) + "人");
     }
 
     private void showExitConfirmation() {
@@ -567,6 +582,16 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     // ===== chatClient.Listener 回调（发生在接收线程，统一切回 EDT 更新界面） =====
 
     @Override
+    public void onLoginResult(boolean success, String reason) {
+        // 登录已在登录界面完成，聊天窗口内不处理
+    }
+
+    @Override
+    public void onRegisterResult(boolean success, String reason) {
+        // 注册在登录界面完成，聊天窗口内不处理
+    }
+
+    @Override
     public void onSystemMessage(String content) {
         SwingUtilities.invokeLater(() -> appendSystemMessage(content));
     }
@@ -579,11 +604,22 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     @Override
     public void onUserList(String[] users) {
         SwingUtilities.invokeLater(() -> {
-            onlineUsersModel.clear();
+            onlineUsers.clear();
             for (String user : users) {
-                onlineUsersModel.addElement(user);
+                onlineUsers.add(user);
             }
-            updateUserCount();
+            refreshUserList();
+        });
+    }
+
+    @Override
+    public void onOfflineUsers(String[] users) {
+        SwingUtilities.invokeLater(() -> {
+            offlineUsers.clear();
+            for (String user : users) {
+                offlineUsers.add(user);
+            }
+            refreshUserList();
         });
     }
 
@@ -643,12 +679,39 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
                 UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
             } catch (Exception ignored) {}
 
-            // 测试入口：直连本机服务器
+            // 测试入口：直连本机服务器并登录（正式入口是 chatEntryUI）
             try {
                 chatClient client = new chatClient();
                 client.connect("127.0.0.1", 8080);
-                clientChatUI chatUI = new clientChatUI("测试用户", "127.0.0.1", 8080, client);
-                chatUI.setVisible(true);
+                client.setListener(new chatClient.Listener() {
+                    @Override
+                    public void onLoginResult(boolean ok, String r) {
+                        if (ok) {
+                            new clientChatUI("测试用户", "127.0.0.1", 8080, client).setVisible(true);
+                        } else {
+                            JOptionPane.showMessageDialog(null, "登录失败：" + r,
+                                    "错误", JOptionPane.ERROR_MESSAGE);
+                            System.exit(1);
+                        }
+                    }
+                    @Override
+                    public void onRegisterResult(boolean ok, String r) {}
+                    @Override
+                    public void onSystemMessage(String c) {}
+                    @Override
+                    public void onChatMessage(String s, String c) {}
+                    @Override
+                    public void onUserList(String[] u) {}
+                    @Override
+                    public void onOfflineUsers(String[] u) {}
+                    @Override
+                    public void onDisconnected(String r) {
+                        JOptionPane.showMessageDialog(null, "连接断开：" + r,
+                                "错误", JOptionPane.ERROR_MESSAGE);
+                        System.exit(1);
+                    }
+                });
+                client.login("测试用户", "123456");
             } catch (IOException e) {
                 JOptionPane.showMessageDialog(null, "无法连接服务器：" + e.getMessage(),
                         "错误", JOptionPane.ERROR_MESSAGE);
