@@ -1,5 +1,4 @@
 package chatPackage;
-package HaruhiChat;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
@@ -8,7 +7,7 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.geom.RoundRectangle2D;
 
-public class chatEntryForm extends JFrame {
+public class chatEntryUI extends JFrame {
 
     private JTextField nicknameField;
     private JTextField ipField;
@@ -25,7 +24,7 @@ public class chatEntryForm extends JFrame {
     private static final Color CANCEL_BG = new Color(235, 238, 245);
     private static final Color CANCEL_HOVER = new Color(220, 224, 235);
 
-    public chatEntryForm() {
+    public chatEntryUI() {
         initUI();
     }
 
@@ -374,7 +373,7 @@ public class chatEntryForm extends JFrame {
             try {
                 UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
             } catch (Exception ignored) {}
-            new chatEntryForm().setVisible(true);
+            new chatEntryUI().setVisible(true);
         });
     }
 }
