@@ -40,12 +40,53 @@ public class dbManager {
         }
         conn.setCatalog(DB_NAME);
 
-        // 创建 Users 表：用户名（主键）+ 密码
+        // 创建 Users 表：用户名（主键）+ 密码 + 角色（admin 管理员 / user 普通用户）
         try (Statement st = conn.createStatement()) {
             st.executeUpdate("CREATE TABLE IF NOT EXISTS Users ("
                     + "username VARCHAR(50) NOT NULL PRIMARY KEY, "
-                    + "password VARCHAR(100) NOT NULL) "
+                    + "password VARCHAR(100) NOT NULL, "
+                    + "role VARCHAR(20) NOT NULL DEFAULT 'user') "
                     + "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        }
+
+        // 兼容旧表：早期版本的 Users 表没有 role 列，检测后补列（已有用户自动成为普通用户）
+        try (var rs = conn.getMetaData().getColumns(conn.getCatalog(), null, "Users", "role")) {
+            if (!rs.next()) {
+                try (Statement st = conn.createStatement()) {
+                    st.executeUpdate("ALTER TABLE Users ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'user'");
+                }
+            }
+        }
+
+        // 初始化管理员账号（INSERT IGNORE：已存在则不覆盖，密码不会被重置）
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT IGNORE INTO Users(username, password, role) VALUES (?, ?, 'admin')")) {
+            ps.setString(1, "admin");
+            ps.setString(2, "20061021");
+            ps.executeUpdate();
+        }
+    }
+
+    /** 查询用户角色，返回 "admin" / "user"；用户不存在返回 null */
+    public synchronized String getRole(String username) throws SQLException {
+        String sql = "SELECT role FROM Users WHERE username = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, username);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return null;
+                }
+                return rs.getString("role");
+            }
+        }
+    }
+
+    /** 从数据库删除用户（封禁）：返回 true 表示删除了记录 */
+    public synchronized boolean deleteUser(String username) throws SQLException {
+        String sql = "DELETE FROM Users WHERE username = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, username);
+            return ps.executeUpdate() > 0;
         }
     }
 

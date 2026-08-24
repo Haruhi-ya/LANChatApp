@@ -26,7 +26,7 @@ import java.nio.charset.StandardCharsets;
  */
 public class chatClient {
 
-    /** 服务器消息回调接口（由 UI 层实现） */
+    /** 服务器消息回调接口（由 UI 层实现；新回调均为 default 实现，老实现无需改动） */
     public interface Listener {
         void onLoginResult(boolean success, String reason);   // LOGINOK / LOGINFAIL:原因
         void onRegisterResult(boolean success, String reason); // REGISTEROK / REGISTERFAIL:原因
@@ -35,6 +35,15 @@ public class chatClient {
         void onUserList(String[] users);               // USERS:... 在线用户列表
         void onOfflineUsers(String[] users);           // OFFLINEUSERS:... 离线用户列表
         void onDisconnected(String reason);            // 连接断开（异常/被服务器关闭/主动退出）
+
+        /** 登录成功后服务端下发的角色：admin / user */
+        default void onRole(String role) {}
+
+        /** 本连接被管理员踢出 */
+        default void onKicked(String reason) {}
+
+        /** 本连接被管理员封禁（账号已删除） */
+        default void onBanned(String reason) {}
     }
 
     /** 连接超时时间（毫秒），局域网连接不上时避免长时间卡住 */
@@ -46,6 +55,14 @@ public class chatClient {
     private volatile boolean connected;
     private volatile boolean notifiedDisconnect;
     private volatile Listener listener;
+
+    // 最近一次的状态缓存：
+    // 登录后的 LOGINOK/USERS/OFFLINEUSERS 广播到达时 UI 监听器可能还没挂载
+    // （登录界面先用临时监听器等待结果，之后再切换到聊天窗口监听器），
+    // 缓存下来并在 setListener 时补发，保证挂上监听器就能立即拿到角色和用户列表
+    private volatile String lastRole;
+    private volatile String[] lastOnlineUsers;
+    private volatile String[] lastOfflineUsers;
 
     /**
      * 建立与服务端的 TCP 连接，并启动接收线程。
@@ -66,6 +83,19 @@ public class chatClient {
 
     public void setListener(Listener listener) {
         this.listener = listener;
+        // 补发缓存的状态，避免监听器挂载前到达的广播丢失
+        // （修复登录后列表迟迟不显示、管理员角色丢失的问题）
+        if (listener != null) {
+            if (lastRole != null) {
+                listener.onRole(lastRole);
+            }
+            if (lastOnlineUsers != null) {
+                listener.onUserList(lastOnlineUsers);
+            }
+            if (lastOfflineUsers != null) {
+                listener.onOfflineUsers(lastOfflineUsers);
+            }
+        }
     }
 
     /** 登录（应放在注册监听器之后调用），结果通过 onLoginResult 回调通知 */
@@ -81,6 +111,16 @@ public class chatClient {
     /** 发送一条聊天消息 */
     public void sendMessage(String content) {
         sendLine("MSG:" + content);
+    }
+
+    /** 管理员：踢出在线用户 */
+    public void kick(String username) {
+        sendLine("KICK:" + username);
+    }
+
+    /** 管理员：封禁用户并从数据库删除其账号 */
+    public void ban(String username) {
+        sendLine("BAN:" + username);
     }
 
     /** 主动退出：发送 LOGOUT 并关闭连接 */
@@ -126,8 +166,12 @@ public class chatClient {
         if (listener == null) {
             return;
         }
-        if (line.equals("LOGINOK")) {
+        if (line.startsWith("LOGINOK")) {
+            // LOGINOK 或 LOGINOK:角色（admin / user）
+            String role = line.startsWith("LOGINOK:") ? line.substring("LOGINOK:".length()) : "user";
+            lastRole = role; // 缓存角色，供监听器挂载时补发
             listener.onLoginResult(true, "");
+            listener.onRole(role);
         } else if (line.startsWith("LOGINFAIL:")) {
             listener.onLoginResult(false, line.substring("LOGINFAIL:".length()));
         } else if (line.equals("REGISTEROK")) {
@@ -148,11 +192,17 @@ public class chatClient {
         } else if (line.startsWith("USERS:")) {
             String list = line.substring("USERS:".length());
             String[] users = list.isEmpty() ? new String[0] : list.split(",");
+            lastOnlineUsers = users; // 缓存，供监听器挂载时补发
             listener.onUserList(users);
         } else if (line.startsWith("OFFLINEUSERS:")) {
             String list = line.substring("OFFLINEUSERS:".length());
             String[] users = list.isEmpty() ? new String[0] : list.split(",");
+            lastOfflineUsers = users; // 缓存，供监听器挂载时补发
             listener.onOfflineUsers(users);
+        } else if (line.startsWith("KICKED:")) {
+            listener.onKicked(line.substring("KICKED:".length()));
+        } else if (line.startsWith("BANNED:")) {
+            listener.onBanned(line.substring("BANNED:".length()));
         }
     }
 

@@ -32,6 +32,9 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     private chatClient client;
     private boolean disconnectedNotified;
 
+    // 当前用户角色（登录成功后由服务端下发）：admin 管理员 / user 普通用户
+    private volatile String role = "user";
+
     // 样式名序号：保证每次插入消息都使用全新的样式对象
     private int styleSeq;
 
@@ -223,6 +226,14 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         usersScrollPane.setBorder(null);
         usersScrollPane.setBackground(SIDEBAR_BG);
         usersPanel.add(usersScrollPane, BorderLayout.CENTER);
+
+        // 右键弹出用户管理菜单（踢人/封禁）
+        userList.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) { showUserPopup(e); }
+            @Override
+            public void mouseReleased(MouseEvent e) { showUserPopup(e); }
+        });
 
         return usersPanel;
     }
@@ -546,6 +557,44 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         }
     }
 
+    /** 用户列表右键菜单：管理员可踢出/封禁用户，普通用户提示无权限 */
+    private void showUserPopup(MouseEvent e) {
+        if (!e.isPopupTrigger()) {
+            return;
+        }
+        int index = userList.locationToIndex(e.getPoint());
+        if (index < 0) {
+            return;
+        }
+        UserEntry entry = userListModel.get(index);
+        if (entry.name.equals(nickname)) {
+            return; // 不能操作自己
+        }
+
+        JPopupMenu menu = new JPopupMenu();
+        if ("admin".equals(role)) {
+            JMenuItem kickItem = new JMenuItem("踢出用户");
+            kickItem.addActionListener(ev -> client.kick(entry.name));
+
+            JMenuItem banItem = new JMenuItem("封禁用户（删除账号）");
+            banItem.addActionListener(ev -> {
+                int ok = JOptionPane.showConfirmDialog(this,
+                        "确定要封禁并删除用户「" + entry.name + "」吗？\n此操作将从数据库删除该账号，不可恢复！",
+                        "封禁确认", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+                if (ok == JOptionPane.YES_OPTION) {
+                    client.ban(entry.name);
+                }
+            });
+            menu.add(kickItem);
+            menu.add(banItem);
+        } else {
+            JMenuItem noPermItem = new JMenuItem("仅管理员可操作");
+            noPermItem.setEnabled(false);
+            menu.add(noPermItem);
+        }
+        menu.show(userList, e.getX(), e.getY());
+    }
+
     /** 按在线优先的顺序重建合并用户列表 */
     private void refreshUserList() {
         userListModel.clear();
@@ -594,6 +643,31 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     @Override
     public void onSystemMessage(String content) {
         SwingUtilities.invokeLater(() -> appendSystemMessage(content));
+    }
+
+    @Override
+    public void onRole(String role) {
+        this.role = role;
+    }
+
+    @Override
+    public void onKicked(String reason) {
+        SwingUtilities.invokeLater(() -> {
+            disconnectedNotified = true; // 防止随后的断线回调重复弹窗
+            appendSystemMessage("⚠️ " + reason);
+            JOptionPane.showMessageDialog(this, reason, "已被踢出", JOptionPane.WARNING_MESSAGE);
+            dispose();
+        });
+    }
+
+    @Override
+    public void onBanned(String reason) {
+        SwingUtilities.invokeLater(() -> {
+            disconnectedNotified = true;
+            appendSystemMessage("⚠️ " + reason);
+            JOptionPane.showMessageDialog(this, reason, "已被封禁", JOptionPane.WARNING_MESSAGE);
+            dispose();
+        });
     }
 
     @Override

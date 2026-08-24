@@ -35,11 +35,16 @@ import java.util.concurrent.ConcurrentHashMap;
  *    REGISTER:用户名:密码  注册新账号（用户名不能含冒号或逗号）
  *    LOGIN:用户名:密码     登录（验证通过后才算进入聊天室）
  *    MSG:消息内容          发送聊天消息
+ *    KICK:用户名           管理员踢人（仅管理员有效）
+ *    BAN:用户名            管理员封禁并从数据库删除用户（仅管理员有效）
  *    LOGOUT                主动退出
  *  服务端 -> 客户端：
  *    REGISTEROK / REGISTERFAIL:原因
- *    LOGINOK / LOGINFAIL:原因
- *    SYSTEM:系统消息         通知类消息（有人加入/离开等）
+ *    LOGINOK:角色           登录成功，角色为 admin / user
+ *    LOGINFAIL:原因
+ *    KICKED:原因            本连接被管理员踢出（随后服务端会关闭连接）
+ *    BANNED:原因            本连接被管理员封禁（随后服务端会关闭连接）
+ *    SYSTEM:系统消息         通知类消息（有人加入/离开/被踢等）
  *    MSG:昵称:消息内容       普通聊天消息（消息体取第一个冒号之后的部分）
  *    USERS:昵称1,昵称2       当前在线用户列表
  *    OFFLINEUSERS:昵称1,昵称2 已注册但不在线的用户列表
@@ -147,6 +152,7 @@ public class chatServer {
 
         private final Socket socket;
         private String nickname;
+        private String role; // 登录后从数据库读取：admin 管理员 / user 普通用户
         private BufferedReader in;
         private PrintWriter out;
 
@@ -188,9 +194,74 @@ public class chatServer {
                     broadcast("MSG:" + nickname + ":" + content);
                     log(nickname + " 说：" + content);
                 }
+            } else if (line.startsWith("KICK:")) {
+                handleKick(line.substring("KICK:".length()).trim());
+            } else if (line.startsWith("BAN:")) {
+                handleBan(line.substring("BAN:".length()).trim());
             } else if (line.equals("LOGOUT")) {
                 disconnect(); // 主动退出，关闭连接后读取循环自然结束
             }
+        }
+
+        /** 当前连接是否为管理员 */
+        private boolean isAdmin() {
+            return "admin".equals(role);
+        }
+
+        /** 管理员踢人：KICK:用户名（将目标用户从当前服务器断开） */
+        private void handleKick(String target) {
+            if (!isAdmin()) {
+                sendTo(this, "SYSTEM:无权限执行此操作");
+                return;
+            }
+            ClientHandler victim = clients.get(target);
+            if (victim == null) {
+                sendTo(this, "SYSTEM:用户「" + target + "」不在线");
+                return;
+            }
+            if (victim == this) {
+                sendTo(this, "SYSTEM:不能移除自己");
+                return;
+            }
+            if (victim.isAdmin()) {
+                sendTo(this, "SYSTEM:不能移除管理员");
+                return;
+            }
+            sendTo(victim, "KICKED:您已被管理员「" + nickname + "」踢出聊天室");
+            broadcast("SYSTEM:" + target + " 已被管理员 " + nickname + " 踢出聊天室");
+            log(nickname + " 将 " + target + " 踢出聊天室");
+            victim.disconnect(); // 从在线表移除并广播离开
+        }
+
+        /** 管理员封禁：BAN:用户名（从数据库删除该用户所有数据，并断开其连接） */
+        private void handleBan(String target) {
+            if (!isAdmin()) {
+                sendTo(this, "SYSTEM:无权限执行此操作");
+                return;
+            }
+            if (target.equals(nickname)) {
+                sendTo(this, "SYSTEM:不能封禁自己");
+                return;
+            }
+            try {
+                boolean deleted = db.deleteUser(target);
+                if (!deleted) {
+                    sendTo(this, "SYSTEM:用户「" + target + "」不存在");
+                    return;
+                }
+            } catch (SQLException e) {
+                System.err.println("封禁失败：" + e.getMessage());
+                sendTo(this, "SYSTEM:封禁失败，请稍后再试");
+                return;
+            }
+            ClientHandler victim = clients.get(target);
+            if (victim != null) {
+                sendTo(victim, "BANNED:您已被管理员「" + nickname + "」封禁，账号已删除");
+                victim.disconnect();
+            }
+            broadcast("SYSTEM:" + target + " 已被管理员 " + nickname + " 封禁（账号已删除）");
+            broadcastOfflineUsers(); // 数据库变化，刷新离线用户列表
+            log(nickname + " 封禁并删除用户 " + target);
         }
 
         /** 注册：REGISTER:用户名:密码 */
@@ -252,7 +323,8 @@ public class chatServer {
                     return;
                 }
                 this.nickname = username;
-                sendTo(this, "LOGINOK");
+                this.role = db.getRole(username); // 登录时查询角色
+                sendTo(this, "LOGINOK:" + role);
                 broadcast("SYSTEM:" + nickname + " 加入了聊天室");
                 broadcastUserList();
                 broadcastOfflineUsers();
