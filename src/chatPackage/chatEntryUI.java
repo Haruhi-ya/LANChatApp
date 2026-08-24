@@ -6,6 +6,7 @@ import java.awt.*;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.geom.RoundRectangle2D;
+import java.io.IOException;
 
 public class chatEntryUI extends JFrame {
 
@@ -299,6 +300,14 @@ public class chatEntryUI extends JFrame {
             return;
         }
 
+        // 昵称不能包含协议保留字符（冒号分隔昵称与内容，逗号分隔用户列表）
+        if (nickname.contains(":") || nickname.contains(",")) {
+            JOptionPane.showMessageDialog(this, "昵称不能包含冒号（:）或逗号（,）", "提示",
+                    JOptionPane.WARNING_MESSAGE);
+            nicknameField.requestFocusInWindow();
+            return;
+        }
+
         // 验证IP地址
         if (ip.isEmpty()) {
             JOptionPane.showMessageDialog(this, "请输入服务器IP地址", "提示",
@@ -324,8 +333,9 @@ public class chatEntryUI extends JFrame {
         }
 
         // 验证端口格式和范围
+        int portNum;
         try {
-            int portNum = Integer.parseInt(port);
+            portNum = Integer.parseInt(port);
             if (portNum < 1 || portNum > 65535) {
                 throw new NumberFormatException();
             }
@@ -336,11 +346,29 @@ public class chatEntryUI extends JFrame {
             return;
         }
 
-        JOptionPane.showMessageDialog(this,
-                "欢迎进入聊天室：" + nickname + "\n服务器：" + ip + ":" + port,
-                "进入成功",
-                JOptionPane.INFORMATION_MESSAGE);
-        dispose();
+        // 在后台线程连接服务器，避免网络耗时阻塞界面（连接失败可留在登录页重新填写）
+        enterButton.setEnabled(false);
+        setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
+        new Thread(() -> {
+            try {
+                chatClient client = new chatClient();
+                client.connect(ip, portNum);
+                // 连接成功后回到 EDT 创建聊天窗口（登录动作在聊天窗口内部完成）
+                SwingUtilities.invokeLater(() -> {
+                    new clientChatUI(nickname, ip, portNum, client).setVisible(true);
+                    dispose();
+                });
+            } catch (IOException e) {
+                SwingUtilities.invokeLater(() -> {
+                    JOptionPane.showMessageDialog(this,
+                            "无法连接到服务器 " + ip + ":" + portNum + "\n" + e.getMessage(),
+                            "连接失败",
+                            JOptionPane.ERROR_MESSAGE);
+                    enterButton.setEnabled(true);
+                    setCursor(Cursor.getDefaultCursor());
+                });
+            }
+        }, "connect-server").start();
     }
 
     private boolean isValidIP(String ip) {

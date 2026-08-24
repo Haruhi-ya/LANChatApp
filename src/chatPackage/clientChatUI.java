@@ -4,6 +4,7 @@ import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.swing.text.*;
 import java.awt.*;
+import java.io.IOException;
 import java.awt.event.*;
 import java.awt.geom.RoundRectangle2D;
 import java.text.SimpleDateFormat;
@@ -11,7 +12,7 @@ import java.util.*;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
-public class clientChatUI extends JFrame {
+public class clientChatUI extends JFrame implements chatClient.Listener {
 
     // UI组件
     private JTextPane chatArea;
@@ -27,6 +28,13 @@ public class clientChatUI extends JFrame {
     private String nickname;
     private String serverIP;
     private int serverPort;
+
+    // 网络层
+    private chatClient client;
+    private boolean disconnectedNotified;
+
+    // 样式名序号：保证每次插入消息都使用全新的样式对象
+    private int styleSeq;
 
     // 在线用户列表
     private DefaultListModel<String> onlineUsersModel;
@@ -55,11 +63,16 @@ public class clientChatUI extends JFrame {
     private JPopupMenu emojiPopup;
     private SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm:ss");
 
-    public clientChatUI(String nickname, String serverIP, int serverPort) {
+    public clientChatUI(String nickname, String serverIP, int serverPort, chatClient client) {
         this.nickname = nickname;
         this.serverIP = serverIP;
         this.serverPort = serverPort;
+        this.client = client;
+        // 注册消息回调（回调发生在接收线程，实现里统一用 invokeLater 切回 EDT 更新界面）
+        client.setListener(this);
         initUI();
+        // UI 就绪后再登录，确保服务端广播的欢迎/用户列表消息不会丢失
+        client.login(nickname);
         appendSystemMessage("欢迎 " + nickname + " 加入聊天室！");
         appendSystemMessage("您已连接到服务器 " + serverIP + ":" + serverPort);
     }
@@ -158,9 +171,8 @@ public class clientChatUI extends JFrame {
         chatArea = new JTextPane();
         chatArea.setEditable(false);
         chatArea.setBackground(CARD_BG);
-        // 设置支持Emoji的字体
-        Font chatFont = getEmojiFont(14);
-        chatArea.setFont(chatFont);
+        // 使用中文字体（微软雅黑含中文和大部分 emoji 字形，emoji 字体不含中文字形会导致中文显示为方块）
+        chatArea.setFont(getChatFont(14));
         chatArea.setBorder(new EmptyBorder(10, 15, 10, 15));
 
         JScrollPane chatScrollPane = new JScrollPane(chatArea);
@@ -240,8 +252,8 @@ public class clientChatUI extends JFrame {
 
         // 中间输入框
         inputField = new JTextField();
-        // 设置支持Emoji的字体
-        inputField.setFont(getEmojiFont(14));
+        // 使用中文字体，保证中文输入正常显示
+        inputField.setFont(getChatFont(14));
         inputField.setForeground(TEXT_DARK);
         inputField.setBackground(BG_LIGHT);
         inputField.setBorder(BorderFactory.createCompoundBorder(
@@ -311,27 +323,28 @@ public class clientChatUI extends JFrame {
         fileChooser.setDialogTitle("选择要发送的文件");
         int result = fileChooser.showOpenDialog(this);
         if (result == JFileChooser.APPROVE_OPTION) {
-            String fileName = fileChooser.getSelectedFile().getName();
-            appendMessage("📎 文件发送: " + fileName, nickname, true);
-            // 这里应该实现实际的文件发送逻辑
+            // 文件传输涉及额外的二进制传输协议，暂未实现
+            JOptionPane.showMessageDialog(this, "文件传输功能开发中，敬请期待",
+                    "提示", JOptionPane.INFORMATION_MESSAGE);
         }
     }
 
     private void sendMessage() {
         String message = inputField.getText().trim();
         if (!message.isEmpty()) {
-            appendMessage(message, nickname, true);
+            // 消息发给服务器，由服务器广播回来后在回调中统一渲染（保证所有人看到的时间一致）
+            client.sendMessage(message);
             inputField.setText("");
             inputField.requestFocusInWindow();
-            // 这里应该实现实际的消息发送逻辑
         }
     }
 
     private void appendMessage(String message, String sender, boolean isMine) {
         StyledDocument doc = chatArea.getStyledDocument();
 
+        // 每次使用唯一的样式名，避免 addStyle 同名复用导致样式被后续消息覆盖
         // 添加时间戳
-        Style timeStyle = chatArea.addStyle("TimeStyle", null);
+        Style timeStyle = chatArea.addStyle("TimeStyle" + (++styleSeq), null);
         StyleConstants.setForeground(timeStyle, SYSTEM_MSG_COLOR);
         StyleConstants.setFontSize(timeStyle, 11);
         StyleConstants.setFontFamily(timeStyle, "Dialog"); // 时间戳使用普通字体
@@ -339,21 +352,21 @@ public class clientChatUI extends JFrame {
         String timeStr = "[" + timeFormat.format(new Date()) + "] ";
 
         // 添加发送者
-        Style senderStyle = chatArea.addStyle("SenderStyle", null);
+        Style senderStyle = chatArea.addStyle("SenderStyle" + (++styleSeq), null);
         StyleConstants.setForeground(senderStyle, getColorForUser(sender));
         StyleConstants.setBold(senderStyle, true);
         StyleConstants.setFontSize(senderStyle, 13);
         StyleConstants.setFontFamily(senderStyle, "Microsoft YaHei"); // 发送者使用中文字体
 
         // 添加消息内容 - 使用支持Emoji的字体
-        Style msgStyle = chatArea.addStyle("MsgStyle", null);
-        StyleConstants.setForeground(msgStyle, isMine ? Color.WHITE : TEXT_DARK);
+        // 自己的消息用主题蓝（聊天区背景是白色，白字会看不见），别人的用深色
+        Style msgStyle = chatArea.addStyle("MsgStyle" + (++styleSeq), null);
+        StyleConstants.setForeground(msgStyle, isMine ? PRIMARY : TEXT_DARK);
         StyleConstants.setFontSize(msgStyle, 14);
         StyleConstants.setBold(msgStyle, false);
 
-        // 设置支持Emoji的字体
-        String emojiFontName = isFontAvailable("Segoe UI Emoji") ? "Segoe UI Emoji" : "Dialog";
-        StyleConstants.setFontFamily(msgStyle, emojiFontName);
+        // 消息内容使用中文字体（emoji 字体没有中文字形，中文会显示为方块）
+        StyleConstants.setFontFamily(msgStyle, isFontAvailable("Microsoft YaHei") ? "Microsoft YaHei" : "Dialog");
 
         try {
             if (isMine) {
@@ -542,6 +555,8 @@ public class clientChatUI extends JFrame {
                 JOptionPane.QUESTION_MESSAGE);
 
         if (result == JOptionPane.YES_OPTION) {
+            // 通知服务器自己下线并关闭连接
+            client.logout();
             dispose();
             System.exit(0);
         } else {
@@ -549,7 +564,54 @@ public class clientChatUI extends JFrame {
         }
     }
 
-    // 辅助方法：获取支持Emoji的字体
+    // ===== chatClient.Listener 回调（发生在接收线程，统一切回 EDT 更新界面） =====
+
+    @Override
+    public void onSystemMessage(String content) {
+        SwingUtilities.invokeLater(() -> appendSystemMessage(content));
+    }
+
+    @Override
+    public void onChatMessage(String sender, String content) {
+        SwingUtilities.invokeLater(() -> appendMessage(content, sender, sender.equals(nickname)));
+    }
+
+    @Override
+    public void onUserList(String[] users) {
+        SwingUtilities.invokeLater(() -> {
+            onlineUsersModel.clear();
+            for (String user : users) {
+                onlineUsersModel.addElement(user);
+            }
+            updateUserCount();
+        });
+    }
+
+    @Override
+    public void onDisconnected(String reason) {
+        SwingUtilities.invokeLater(() -> {
+            if (disconnectedNotified) {
+                return;
+            }
+            disconnectedNotified = true;
+            connectionStatusLabel.setText("● 已断开");
+            connectionStatusLabel.setForeground(new Color(220, 60, 60));
+            appendSystemMessage("与服务器的连接已断开：" + reason);
+            JOptionPane.showMessageDialog(this, "与服务器的连接已断开：\n" + reason,
+                    "连接断开", JOptionPane.WARNING_MESSAGE);
+            dispose();
+        });
+    }
+
+    // 辅助方法：获取中文字体（微软雅黑支持中文和大部分 emoji）
+    private Font getChatFont(int size) {
+        if (isFontAvailable("Microsoft YaHei")) {
+            return new Font("Microsoft YaHei", Font.PLAIN, size);
+        }
+        return new Font("Dialog", Font.PLAIN, size);
+    }
+
+    // 辅助方法：获取支持Emoji的字体（仅用于只显示 emoji 的按钮）
     private Font getEmojiFont(int size) {
         if (isFontAvailable("Segoe UI Emoji")) {
             return new Font("Segoe UI Emoji", Font.PLAIN, size);
@@ -581,9 +643,17 @@ public class clientChatUI extends JFrame {
                 UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
             } catch (Exception ignored) {}
 
-            // 创建聊天界面
-            clientChatUI chatUI = new clientChatUI("测试用户", "192.168.1.100", 8080);
-            chatUI.setVisible(true);
+            // 测试入口：直连本机服务器
+            try {
+                chatClient client = new chatClient();
+                client.connect("127.0.0.1", 8080);
+                clientChatUI chatUI = new clientChatUI("测试用户", "127.0.0.1", 8080, client);
+                chatUI.setVisible(true);
+            } catch (IOException e) {
+                JOptionPane.showMessageDialog(null, "无法连接服务器：" + e.getMessage(),
+                        "错误", JOptionPane.ERROR_MESSAGE);
+                System.exit(1);
+            }
         });
     }
 }
