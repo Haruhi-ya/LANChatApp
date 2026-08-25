@@ -2,72 +2,74 @@ package chatPackage;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
-import javax.swing.text.*;
 import java.awt.*;
-import java.io.IOException;
 import java.awt.event.*;
-import java.awt.geom.RoundRectangle2D;
-import java.text.SimpleDateFormat;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * 主聊天窗口：公共聊天室 + 用户列表 + 私聊入口。
+ *
+ * 本类是 chatClient 唯一的监听器（chatClient 是单监听器设计，setListener 为整体替换），
+ * 因此所有消息都先到这里，再由这里路由到对应的私聊窗口。privateChatUI 不允许自己
+ * 注册监听器，否则主窗口会立刻失去全部回调。
+ *
+ * 线程约定：chatClient 的回调发生在网络接收线程上，所有回调实现都用
+ * SwingUtilities.invokeLater 切回 EDT 之后再碰界面和下面这两张表。
+ */
 public class clientChatUI extends JFrame implements chatClient.Listener {
+
+    /** 公共历史加载超时，服务端中途断开时不至于让界面一直空着 */
+    private static final int HISTORY_TIMEOUT_MS = 10_000;
 
     // UI组件
     private JTextPane chatArea;
     private JTextField inputField;
-    private JButton sendButton;
     private JButton emojiButton;
-    private JPanel onlineUsersPanel;
+    private JButton clearPublicButton;
     private JLabel connectionStatusLabel;
     private JLabel userCountLabel;
 
     // 用户信息
-    private String nickname;
-    private String serverIP;
-    private int serverPort;
+    private final String nickname;
+    private final String serverIP;
+    private final int serverPort;
 
     // 网络层
-    private chatClient client;
+    private final chatClient client;
     private boolean disconnectedNotified;
 
     // 当前用户角色（登录成功后由服务端下发）：admin 管理员 / user 普通用户
     private volatile String role = "user";
 
-    // 样式名序号：保证每次插入消息都使用全新的样式对象
-    private int styleSeq;
-
     // 用户列表（在线 + 离线合并显示）
     private DefaultListModel<UserEntry> userListModel;
     private JList<UserEntry> userList;
-    private Map<String, Color> userColors = new ConcurrentHashMap<>();
 
     // 在线/离线用户集合（由服务端广播更新，合并显示时在线用户排前面）
     private final Set<String> onlineUsers = new LinkedHashSet<>();
     private final Set<String> offlineUsers = new LinkedHashSet<>();
 
-    // 颜色定义
-    private static final Color PRIMARY = new Color(99, 132, 255);
-    private static final Color PRIMARY_HOVER = new Color(75, 108, 235);
-    private static final Color BG_LIGHT = new Color(245, 247, 252);
-    private static final Color SIDEBAR_BG = new Color(248, 249, 252);
-    private static final Color CARD_BG = Color.WHITE;
-    private static final Color TEXT_DARK = new Color(44, 52, 74);
-    private static final Color TEXT_GRAY = new Color(140, 149, 168);
-    private static final Color ONLINE_GREEN = new Color(52, 199, 123);
-    private static final Color MESSAGE_BG = new Color(240, 243, 250);
-    private static final Color MY_MESSAGE_BG = new Color(99, 132, 255);
-    private static final Color SYSTEM_MSG_COLOR = new Color(150, 155, 170);
+    /** 已打开的私聊窗口：会话对方 -> 窗口。只在 EDT 上访问 */
+    private final Map<String, privateChatUI> privateWindows = new ConcurrentHashMap<>();
 
-    // 简单的表情符号映射
-    private static final String[] EMOJIS = {"😀", "😂", "🤣", "😊", "😍", "🥰", "😘", "😎",
-            "🤔", "🤗", "😅", "😉", "🙃", "😋", "😴", "🤯",
-            "😇", "🥳", "😭", "😤", "👍", "👎", "👏", "🙏",
-            "💪", "🤝", "❤️", "💔", "🎉", "✨", "🔥", "💯"};
+    /** 各会话的未读条数，值一律取服务端下发的权威计数，不在本地自增 */
+    private final Map<String, Integer> unreadCounts = new ConcurrentHashMap<>();
+
+    /**
+     * 公共历史是否加载完毕。加载期间到达的实时消息先缓冲，等 HISTEND 后再补渲染。
+     * 原因与私聊窗口相同：服务端的历史回放和实时广播是两个线程写同一个 socket，
+     * 跨行顺序没有保证，不缓冲就会出现重复或乱序。
+     */
+    private boolean historyLoaded;
+    private final List<Object[]> pendingPublic = new ArrayList<>();
+    private Timer historyTimeout;
 
     private JPopupMenu emojiPopup;
-    private SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm:ss");
 
     public clientChatUI(String nickname, String serverIP, int serverPort, chatClient client) {
         this.nickname = nickname;
@@ -78,25 +80,20 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         // 注意：登录验证已在登录界面完成，这里只接管消息渲染，不能再调用 login()
         client.setListener(this);
         initUI();
-        appendSystemMessage("欢迎 " + nickname + " 加入聊天室！");
-        appendSystemMessage("您已连接到服务器 " + serverIP + ":" + serverPort);
+        beginHistoryLoad();
     }
 
     private void initUI() {
         setTitle("局域网聊天室 - " + nickname);
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         setSize(900, 650);
         setMinimumSize(new Dimension(800, 600));
         setLocationRelativeTo(null);
 
-        // 主面板
-        JPanel mainPanel = new JPanel(new BorderLayout(0, 0));
-        mainPanel.setBackground(BG_LIGHT);
-
-        // 顶部信息栏
+        JPanel mainPanel = new JPanel(new BorderLayout());
+        mainPanel.setBackground(chatTheme.BG_LIGHT);
         mainPanel.add(createTopBar(), BorderLayout.NORTH);
 
-        // 中间聊天区域和在线用户列表
         JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT,
                 createChatPanel(), createOnlineUsersPanel());
         splitPane.setDividerLocation(650);
@@ -105,15 +102,11 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         splitPane.setEnabled(false);
         mainPanel.add(splitPane, BorderLayout.CENTER);
 
-        // 底部输入区域
         mainPanel.add(createInputPanel(), BorderLayout.SOUTH);
-
         add(mainPanel);
 
-        // 创建表情选择弹窗
-        createEmojiPopup();
+        emojiPopup = chatTheme.createEmojiPopup(inputField);
 
-        // 添加窗口关闭监听
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosing(WindowEvent e) {
@@ -124,10 +117,10 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
 
     private JPanel createTopBar() {
         JPanel topBar = new JPanel(new BorderLayout());
-        topBar.setBackground(CARD_BG);
+        topBar.setBackground(chatTheme.CARD_BG);
         topBar.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(0, 0, 1, 0, new Color(220, 225, 235)),
-                BorderFactory.createEmptyBorder(12, 20, 12, 20)
+                BorderFactory.createMatteBorder(0, 0, 1, 0, chatTheme.BORDER),
+                new EmptyBorder(12, 20, 12, 20)
         ));
 
         // 左侧：标题和连接信息
@@ -136,103 +129,104 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
 
         JLabel titleLabel = new JLabel("💬 聊天室");
         titleLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 16));
-        titleLabel.setForeground(TEXT_DARK);
+        titleLabel.setForeground(chatTheme.TEXT_DARK);
         leftPanel.add(titleLabel);
 
         connectionStatusLabel = new JLabel("● 已连接");
         connectionStatusLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
-        connectionStatusLabel.setForeground(ONLINE_GREEN);
+        connectionStatusLabel.setForeground(chatTheme.ONLINE_GREEN);
         leftPanel.add(connectionStatusLabel);
 
         topBar.add(leftPanel, BorderLayout.WEST);
 
-        // 右侧：用户信息
+        // 右侧：管理员操作 + 用户信息
         JPanel rightPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
         rightPanel.setOpaque(false);
 
+        // 清空公共记录：仅管理员可见，角色由服务端在 onRole 回调里下发后才显示
+        clearPublicButton = chatTheme.createStyledButton("🗑 清空聊天记录",
+                new Color(235, 238, 245), chatTheme.TEXT_DARK, new Color(220, 224, 235));
+        clearPublicButton.setPreferredSize(new Dimension(120, 32));
+        clearPublicButton.setVisible(false);
+        clearPublicButton.addActionListener(e -> confirmClearPublic());
+        rightPanel.add(clearPublicButton);
+
         JLabel serverInfoLabel = new JLabel("服务器: " + serverIP + ":" + serverPort);
         serverInfoLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
-        serverInfoLabel.setForeground(TEXT_GRAY);
+        serverInfoLabel.setForeground(chatTheme.TEXT_GRAY);
         rightPanel.add(serverInfoLabel);
 
-        JLabel avatarLabel = createAvatarLabel(nickname);
+        JLabel avatarLabel = chatTheme.createAvatarLabel(nickname, 30, 14);
+        avatarLabel.setBorder(BorderFactory.createLineBorder(Color.WHITE, 2));
         rightPanel.add(avatarLabel);
 
         JLabel nicknameLabel = new JLabel(nickname);
         nicknameLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 13));
-        nicknameLabel.setForeground(TEXT_DARK);
+        nicknameLabel.setForeground(chatTheme.TEXT_DARK);
         rightPanel.add(nicknameLabel);
 
         topBar.add(rightPanel, BorderLayout.EAST);
-
         return topBar;
     }
 
     private JPanel createChatPanel() {
-        JPanel chatPanel = new JPanel(new BorderLayout(0, 0));
-        chatPanel.setBackground(CARD_BG);
-
-        // 聊天消息显示区域
-        chatArea = new JTextPane();
-        chatArea.setEditable(false);
-        chatArea.setBackground(CARD_BG);
-        // 使用中文字体（微软雅黑含中文和大部分 emoji 字形，emoji 字体不含中文字形会导致中文显示为方块）
-        chatArea.setFont(getChatFont(14));
-        chatArea.setBorder(new EmptyBorder(10, 15, 10, 15));
-
-        JScrollPane chatScrollPane = new JScrollPane(chatArea);
-        chatScrollPane.setBorder(null);
-        chatScrollPane.getVerticalScrollBar().setUnitIncrement(16);
-        chatScrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
-        chatPanel.add(chatScrollPane, BorderLayout.CENTER);
-
+        JPanel chatPanel = new JPanel(new BorderLayout());
+        chatPanel.setBackground(chatTheme.CARD_BG);
+        chatArea = chatTheme.createChatPane();
+        chatPanel.add(chatTheme.wrapScroll(chatArea), BorderLayout.CENTER);
         return chatPanel;
     }
 
     private JPanel createOnlineUsersPanel() {
-        JPanel usersPanel = new JPanel(new BorderLayout(0, 0));
-        usersPanel.setBackground(SIDEBAR_BG);
+        JPanel usersPanel = new JPanel(new BorderLayout());
+        usersPanel.setBackground(chatTheme.SIDEBAR_BG);
         usersPanel.setPreferredSize(new Dimension(200, 0));
-        usersPanel.setBorder(BorderFactory.createMatteBorder(0, 1, 0, 0, new Color(220, 225, 235)));
+        usersPanel.setBorder(BorderFactory.createMatteBorder(0, 1, 0, 0, chatTheme.BORDER));
 
-        // 标题
         JPanel headerPanel = new JPanel(new BorderLayout());
-        headerPanel.setBackground(SIDEBAR_BG);
+        headerPanel.setBackground(chatTheme.SIDEBAR_BG);
         headerPanel.setBorder(new EmptyBorder(15, 15, 10, 15));
 
-        JLabel headerLabel = new JLabel("在线用户");
+        JLabel headerLabel = new JLabel("用户列表");
         headerLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 14));
-        headerLabel.setForeground(TEXT_DARK);
+        headerLabel.setForeground(chatTheme.TEXT_DARK);
         headerPanel.add(headerLabel, BorderLayout.WEST);
 
-        userCountLabel = new JLabel("1人在线"); // 初始只有自己在线
+        userCountLabel = new JLabel("1人在线");
         userCountLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
-        userCountLabel.setForeground(TEXT_GRAY);
+        userCountLabel.setForeground(chatTheme.TEXT_GRAY);
         headerPanel.add(userCountLabel, BorderLayout.EAST);
 
         usersPanel.add(headerPanel, BorderLayout.NORTH);
 
-        // 用户列表（登录后由服务端广播的在线/离线用户数据填充）
         userListModel = new DefaultListModel<>();
         userList = new JList<>(userListModel);
-        userList.setBackground(SIDEBAR_BG);
+        userList.setBackground(chatTheme.SIDEBAR_BG);
         userList.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
-        userList.setForeground(TEXT_DARK);
+        userList.setForeground(chatTheme.TEXT_DARK);
         userList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         userList.setCellRenderer(new UserListCellRenderer());
         userList.setFixedCellHeight(40);
+        userList.setToolTipText("右键发起私聊，双击直接打开");
 
-        JScrollPane usersScrollPane = new JScrollPane(userList);
-        usersScrollPane.setBorder(null);
-        usersScrollPane.setBackground(SIDEBAR_BG);
-        usersPanel.add(usersScrollPane, BorderLayout.CENTER);
+        usersPanel.add(chatTheme.wrapScroll(userList), BorderLayout.CENTER);
 
-        // 右键弹出用户管理菜单（踢人/封禁）
         userList.addMouseListener(new MouseAdapter() {
             @Override
             public void mousePressed(MouseEvent e) { showUserPopup(e); }
             @Override
             public void mouseReleased(MouseEvent e) { showUserPopup(e); }
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                // 双击直接开私聊：看到未读红点的人第一反应就是双击，
+                // 只做右键入口会让红点变成点不开的摆设
+                if (e.getClickCount() == 2 && SwingUtilities.isLeftMouseButton(e)) {
+                    UserEntry entry = entryAt(e.getPoint());
+                    if (entry != null && !entry.name.equals(nickname)) {
+                        openPrivateChat(entry.name);
+                    }
+                }
+            }
         });
 
         return usersPanel;
@@ -240,88 +234,30 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
 
     private JPanel createInputPanel() {
         JPanel inputPanel = new JPanel(new BorderLayout(8, 0));
-        inputPanel.setBackground(CARD_BG);
+        inputPanel.setBackground(chatTheme.CARD_BG);
         inputPanel.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(1, 0, 0, 0, new Color(220, 225, 235)),
-                BorderFactory.createEmptyBorder(15, 20, 15, 20)
+                BorderFactory.createMatteBorder(1, 0, 0, 0, chatTheme.BORDER),
+                new EmptyBorder(15, 20, 15, 20)
         ));
 
-        // 左侧按钮组
         JPanel buttonGroup = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
         buttonGroup.setOpaque(false);
-
-        emojiButton = createIconButton("😊", "表情");
-        emojiButton.addActionListener(e -> showEmojiPopup());
+        emojiButton = chatTheme.createIconButton("😊", "表情");
+        emojiButton.addActionListener(e -> emojiPopup.show(emojiButton, 0, emojiButton.getHeight()));
         buttonGroup.add(emojiButton);
-
         inputPanel.add(buttonGroup, BorderLayout.WEST);
 
-        // 中间输入框
-        inputField = new JTextField();
-        // 使用中文字体，保证中文输入正常显示
-        inputField.setFont(getChatFont(14));
-        inputField.setForeground(TEXT_DARK);
-        inputField.setBackground(BG_LIGHT);
-        inputField.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(new Color(210, 215, 230), 1, true),
-                BorderFactory.createEmptyBorder(10, 15, 10, 15)
-        ));
+        inputField = chatTheme.createInputField();
         inputField.addActionListener(e -> sendMessage());
         inputPanel.add(inputField, BorderLayout.CENTER);
 
-        // 右侧发送按钮
-        sendButton = createStyledButton("发送", PRIMARY, Color.WHITE, PRIMARY_HOVER);
+        JButton sendButton = chatTheme.createStyledButton("发送", chatTheme.PRIMARY,
+                Color.WHITE, chatTheme.PRIMARY_HOVER);
         sendButton.setPreferredSize(new Dimension(80, 40));
         sendButton.addActionListener(e -> sendMessage());
         inputPanel.add(sendButton, BorderLayout.EAST);
 
         return inputPanel;
-    }
-
-    private void createEmojiPopup() {
-        emojiPopup = new JPopupMenu();
-        JPanel emojiPanel = new JPanel(new GridLayout(4, 8, 5, 5));
-        emojiPanel.setBackground(CARD_BG);
-        emojiPanel.setBorder(new EmptyBorder(10, 10, 10, 10));
-
-        for (String emoji : EMOJIS) {
-            JButton emojiBtn = new JButton(emoji);
-            // 设置支持Emoji的字体
-            emojiBtn.setFont(getEmojiFont(20));
-            emojiBtn.setPreferredSize(new Dimension(40, 40));
-            emojiBtn.setBackground(CARD_BG);
-            emojiBtn.setBorder(BorderFactory.createLineBorder(new Color(230, 233, 240), 1));
-            emojiBtn.setFocusPainted(false);
-            emojiBtn.setCursor(new Cursor(Cursor.HAND_CURSOR));
-
-            final String emojiText = emoji;
-            emojiBtn.addActionListener(e -> {
-                inputField.setText(inputField.getText() + emojiText);
-                emojiPopup.setVisible(false);
-                inputField.requestFocusInWindow();
-            });
-
-            // 悬停效果
-            emojiBtn.addMouseListener(new MouseAdapter() {
-                @Override
-                public void mouseEntered(MouseEvent e) {
-                    emojiBtn.setBackground(BG_LIGHT);
-                }
-
-                @Override
-                public void mouseExited(MouseEvent e) {
-                    emojiBtn.setBackground(CARD_BG);
-                }
-            });
-
-            emojiPanel.add(emojiBtn);
-        }
-
-        emojiPopup.add(emojiPanel);
-    }
-
-    private void showEmojiPopup() {
-        emojiPopup.show(emojiButton, 0, emojiButton.getHeight());
     }
 
     private void sendMessage() {
@@ -334,252 +270,142 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         }
     }
 
-    private void appendMessage(String message, String sender, boolean isMine) {
-        StyledDocument doc = chatArea.getStyledDocument();
+    // ===== 公共历史 =====
 
-        // 每次使用唯一的样式名，避免 addStyle 同名复用导致样式被后续消息覆盖
-        // 添加时间戳
-        Style timeStyle = chatArea.addStyle("TimeStyle" + (++styleSeq), null);
-        StyleConstants.setForeground(timeStyle, SYSTEM_MSG_COLOR);
-        StyleConstants.setFontSize(timeStyle, 11);
-        StyleConstants.setFontFamily(timeStyle, "Dialog"); // 时间戳使用普通字体
+    private void beginHistoryLoad() {
+        historyLoaded = false;
+        pendingPublic.clear();
+        client.requestPublicHistory();
+        client.requestUnread();
 
-        String timeStr = "[" + timeFormat.format(new Date()) + "] ";
-
-        // 添加发送者
-        Style senderStyle = chatArea.addStyle("SenderStyle" + (++styleSeq), null);
-        StyleConstants.setForeground(senderStyle, getColorForUser(sender));
-        StyleConstants.setBold(senderStyle, true);
-        StyleConstants.setFontSize(senderStyle, 13);
-        StyleConstants.setFontFamily(senderStyle, "Microsoft YaHei"); // 发送者使用中文字体
-
-        // 添加消息内容 - 使用支持Emoji的字体
-        // 自己的消息用主题蓝（聊天区背景是白色，白字会看不见），别人的用深色
-        Style msgStyle = chatArea.addStyle("MsgStyle" + (++styleSeq), null);
-        StyleConstants.setForeground(msgStyle, isMine ? PRIMARY : TEXT_DARK);
-        StyleConstants.setFontSize(msgStyle, 14);
-        StyleConstants.setBold(msgStyle, false);
-
-        // 消息内容使用中文字体（emoji 字体没有中文字形，中文会显示为方块）
-        StyleConstants.setFontFamily(msgStyle, isFontAvailable("Microsoft YaHei") ? "Microsoft YaHei" : "Dialog");
-
-        try {
-            if (isMine) {
-                doc.insertString(doc.getLength(), "  ", msgStyle);
-            }
-            doc.insertString(doc.getLength(), timeStr, timeStyle);
-            doc.insertString(doc.getLength(), sender + ": ", senderStyle);
-            doc.insertString(doc.getLength(), message + "\n", msgStyle);
-
-            // 自动滚动到底部
-            chatArea.setCaretPosition(doc.getLength());
-        } catch (BadLocationException e) {
-            e.printStackTrace();
-        }
-    }
-
-    // 用户专属颜色调色板：色相均匀分布的 16 种高区分度颜色。
-    // 旧实现用 hashCode % 360 当色相，相近昵称的 hash 只差 1，颜色几乎一样，
-    // 视觉上就像所有用户都被硬编码成了同一种颜色。
-    private static final int USER_COLOR_COUNT = 16;
-
-    private Color getColorForUser(String username) {
-        if (!userColors.containsKey(username)) {
-            // 按用户名哈希稳定分配调色板颜色，同一用户颜色永远不变
-            int index = Math.floorMod(username.hashCode(), USER_COLOR_COUNT);
-            float hue = index * (360.0f / USER_COLOR_COUNT);
-            Color color = Color.getHSBColor(hue / 360.0f, 0.7f, 0.85f);
-            userColors.put(username, color);
-        }
-        return userColors.get(username);
-    }
-
-    private JLabel createAvatarLabel(String username) {
-        JLabel avatarLabel = new JLabel();
-        avatarLabel.setPreferredSize(new Dimension(30, 30));
-        avatarLabel.setHorizontalAlignment(SwingConstants.CENTER);
-        avatarLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 14));
-        avatarLabel.setForeground(Color.WHITE);
-        avatarLabel.setOpaque(true);
-        avatarLabel.setBackground(getColorForUser(username));
-        avatarLabel.setText(username.substring(0, 1).toUpperCase());
-        avatarLabel.setBorder(BorderFactory.createLineBorder(Color.WHITE, 2));
-        avatarLabel.setCursor(new Cursor(Cursor.HAND_CURSOR));
-        avatarLabel.setToolTipText(username);
-        return avatarLabel;
-    }
-
-    private JButton createIconButton(String text, String tooltip) {
-        JButton button = new JButton(text);
-        // 设置支持Emoji的字体
-        button.setFont(getEmojiFont(20));
-        button.setToolTipText(tooltip);
-        button.setPreferredSize(new Dimension(40, 40));
-        button.setBackground(CARD_BG);
-        button.setBorder(BorderFactory.createLineBorder(new Color(220, 225, 235), 1, true));
-        button.setFocusPainted(false);
-        button.setCursor(new Cursor(Cursor.HAND_CURSOR));
-
-        button.addMouseListener(new MouseAdapter() {
-            @Override
-            public void mouseEntered(MouseEvent e) {
-                button.setBackground(BG_LIGHT);
-            }
-
-            @Override
-            public void mouseExited(MouseEvent e) {
-                button.setBackground(CARD_BG);
+        historyTimeout = new Timer(HISTORY_TIMEOUT_MS, e -> {
+            if (!historyLoaded) {
+                finishHistoryLoad();
             }
         });
-
-        return button;
+        historyTimeout.setRepeats(false);
+        historyTimeout.start();
     }
 
-    private JButton createStyledButton(String text, Color bg, Color fg, Color hoverBg) {
-        JButton button = new JButton(text) {
-            @Override
-            protected void paintComponent(Graphics g) {
-                Graphics2D g2 = (Graphics2D) g.create();
-                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                if (getModel().isPressed()) {
-                    g2.setColor(hoverBg);
-                } else if (getModel().isRollover()) {
-                    g2.setColor(hoverBg);
-                } else {
-                    g2.setColor(bg);
-                }
-                g2.fill(new RoundRectangle2D.Float(0, 0, getWidth(), getHeight(), 10, 10));
-                g2.dispose();
-                super.paintComponent(g);
-            }
-        };
-        button.setFont(new Font("Microsoft YaHei", Font.BOLD, 13));
-        button.setForeground(fg);
-        button.setContentAreaFilled(false);
-        button.setOpaque(false);
-        button.setBorderPainted(false);
-        button.setFocusPainted(false);
-        button.setCursor(new Cursor(Cursor.HAND_CURSOR));
-
-        button.addMouseListener(new MouseAdapter() {
-            @Override
-            public void mouseEntered(MouseEvent e) { button.repaint(); }
-            @Override
-            public void mouseExited(MouseEvent e) { button.repaint(); }
-        });
-
-        return button;
+    private void finishHistoryLoad() {
+        if (historyTimeout != null) {
+            historyTimeout.stop();
+        }
+        for (Object[] m : pendingPublic) {
+            chatTheme.appendMessage(chatArea, (String) m[0], (Long) m[1], (String) m[2],
+                    ((String) m[0]).equals(nickname));
+        }
+        pendingPublic.clear();
+        historyLoaded = true;
+        chatTheme.appendSystemMessage(chatArea, "欢迎 " + nickname + " 加入聊天室！");
+        chatTheme.appendSystemMessage(chatArea, "您已连接到服务器 " + serverIP + ":" + serverPort);
     }
 
-    /** 用户列表条目：用户名 + 在线状态 */
-    private static class UserEntry {
-        final String name;
-        final boolean online;
-
-        UserEntry(String name, boolean online) {
-            this.name = name;
-            this.online = online;
+    private void confirmClearPublic() {
+        int ok = JOptionPane.showConfirmDialog(this,
+                "确定要清空公共聊天室的全部聊天记录吗？\n此操作会删除所有人的公共聊天历史，不可恢复！",
+                "清空确认", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (ok == JOptionPane.YES_OPTION) {
+            client.clearPublicHistory();
         }
     }
 
-    // 用户列表自定义渲染器（在线绿色状态点，离线灰色状态点和灰显名字）
-    private class UserListCellRenderer extends JPanel implements ListCellRenderer<UserEntry> {
-        private JLabel avatarLabel;
-        private JLabel nameLabel;
-        private JLabel statusLabel;
+    // ===== 私聊窗口管理 =====
 
-        public UserListCellRenderer() {
-            setLayout(new BorderLayout(10, 0));
-            setBorder(new EmptyBorder(5, 10, 5, 10));
-            setOpaque(true);
-
-            avatarLabel = new JLabel();
-            avatarLabel.setPreferredSize(new Dimension(28, 28));
-            avatarLabel.setHorizontalAlignment(SwingConstants.CENTER);
-            avatarLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 12));
-            avatarLabel.setForeground(Color.WHITE);
-            avatarLabel.setOpaque(true);
-
-            JPanel centerPanel = new JPanel(new BorderLayout(0, 2));
-            centerPanel.setOpaque(false);
-
-            nameLabel = new JLabel();
-            nameLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
-            nameLabel.setForeground(TEXT_DARK);
-
-            statusLabel = new JLabel("●");
-            statusLabel.setFont(new Font("Dialog", Font.PLAIN, 10));
-            statusLabel.setForeground(ONLINE_GREEN);
-            statusLabel.setHorizontalAlignment(SwingConstants.RIGHT);
-
-            centerPanel.add(nameLabel, BorderLayout.CENTER);
-            centerPanel.add(statusLabel, BorderLayout.EAST);
-
-            add(avatarLabel, BorderLayout.WEST);
-            add(centerPanel, BorderLayout.CENTER);
+    /**
+     * 打开（或前置已打开的）与某人的私聊窗口。
+     * 必须在 EDT 上调用——窗口创建可能由用户点击触发，也可能由收到消息触发，
+     * 统一在 EDT 上做才不会为同一个人建出两个窗口。
+     */
+    private privateChatUI openPrivateChat(String peer) {
+        privateChatUI window = privateWindows.get(peer);
+        if (window == null || !window.isDisplayable()) {
+            window = new privateChatUI(nickname, peer, onlineUsers.contains(peer), client, this);
+            privateWindows.put(peer, window);
+            window.setVisible(true);
+        } else {
+            window.setState(Frame.NORMAL);
+            window.toFront();
         }
+        // 打开即视为已读
+        clearUnread(peer);
+        window.focusInput();
+        return window;
+    }
 
-        @Override
-        public Component getListCellRendererComponent(JList<? extends UserEntry> list, UserEntry value,
-                                                      int index, boolean isSelected, boolean cellHasFocus) {
-            if (value != null) {
-                avatarLabel.setText(value.name.substring(0, 1).toUpperCase());
-                avatarLabel.setBackground(getColorForUser(value.name));
-                nameLabel.setText(value.name);
-                // 在线用户绿色状态点 + 深色名字；离线用户灰色状态点 + 灰显名字
-                statusLabel.setForeground(value.online ? ONLINE_GREEN : new Color(170, 175, 190));
-                nameLabel.setForeground(value.online ? TEXT_DARK : new Color(160, 165, 180));
-            }
+    /** 私聊窗口关闭时的回调，必须把映射摘掉，否则后续消息会被渲染进不可见的窗口 */
+    void onPrivateWindowClosed(String peer) {
+        privateWindows.remove(peer);
+    }
 
-            if (isSelected) {
-                setBackground(new Color(235, 238, 250));
-            } else {
-                setBackground(SIDEBAR_BG);
-            }
+    private void closeAllPrivateWindows() {
+        for (privateChatUI w : new ArrayList<>(privateWindows.values())) {
+            w.dispose();
+        }
+        privateWindows.clear();
+    }
 
-            return this;
+    private void setUnread(String peer, int count) {
+        if (count <= 0) {
+            unreadCounts.remove(peer);
+        } else {
+            unreadCounts.put(peer, count);
+        }
+        // UserEntry 对象本身没变，JList 不会自动重绘，必须显式触发
+        userList.repaint();
+    }
+
+    private void clearUnread(String peer) {
+        if (unreadCounts.remove(peer) != null) {
+            userList.repaint();
         }
     }
 
-    private void appendSystemMessage(String message) {
-        StyledDocument doc = chatArea.getStyledDocument();
-        Style systemStyle = chatArea.addStyle("SystemStyle", null);
-        StyleConstants.setForeground(systemStyle, SYSTEM_MSG_COLOR);
-        StyleConstants.setFontSize(systemStyle, 12);
-        StyleConstants.setItalic(systemStyle, true);
-        StyleConstants.setFontFamily(systemStyle, "Microsoft YaHei");
+    // ===== 用户列表 =====
 
-        try {
-            doc.insertString(doc.getLength(), "ℹ️ " + message + "\n", systemStyle);
-            chatArea.setCaretPosition(doc.getLength());
-        } catch (BadLocationException e) {
-            e.printStackTrace();
+    /** 取鼠标位置对应的用户条目，点在空白处返回 null */
+    private UserEntry entryAt(Point p) {
+        int index = userList.locationToIndex(p);
+        if (index < 0) {
+            return null;
         }
+        // locationToIndex 对列表下方的空白区域也会返回最后一项，必须再验一次边界，
+        // 否则右键空白处会误操作到最后一个用户
+        Rectangle bounds = userList.getCellBounds(index, index);
+        if (bounds == null || !bounds.contains(p)) {
+            return null;
+        }
+        return userListModel.get(index);
     }
 
-    /** 用户列表右键菜单：管理员可踢出/封禁用户，普通用户提示无权限 */
+    /** 用户列表右键菜单：所有人都能发私聊，踢出/封禁仅管理员可见 */
     private void showUserPopup(MouseEvent e) {
         if (!e.isPopupTrigger()) {
             return;
         }
-        int index = userList.locationToIndex(e.getPoint());
-        if (index < 0) {
-            return;
+        UserEntry entry = entryAt(e.getPoint());
+        if (entry == null || entry.name.equals(nickname)) {
+            return; // 空白处或自己，不弹菜单
         }
-        UserEntry entry = userListModel.get(index);
-        if (entry.name.equals(nickname)) {
-            return; // 不能操作自己
-        }
+        userList.setSelectedValue(entry, false);
 
         JPopupMenu menu = new JPopupMenu();
+
+        JMenuItem pmItem = new JMenuItem("发送私聊");
+        pmItem.addActionListener(ev -> openPrivateChat(entry.name));
+        menu.add(pmItem);
+
         if ("admin".equals(role)) {
+            menu.addSeparator();
+
             JMenuItem kickItem = new JMenuItem("踢出用户");
             kickItem.addActionListener(ev -> client.kick(entry.name));
 
             JMenuItem banItem = new JMenuItem("封禁用户（删除账号）");
             banItem.addActionListener(ev -> {
                 int ok = JOptionPane.showConfirmDialog(this,
-                        "确定要封禁并删除用户「" + entry.name + "」吗？\n此操作将从数据库删除该账号，不可恢复！",
+                        "确定要封禁并删除用户「" + entry.name + "」吗？\n"
+                                + "此操作将从数据库删除该账号及其全部私聊记录，不可恢复！",
                         "封禁确认", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
                 if (ok == JOptionPane.YES_OPTION) {
                     client.ban(entry.name);
@@ -587,10 +413,6 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
             });
             menu.add(kickItem);
             menu.add(banItem);
-        } else {
-            JMenuItem noPermItem = new JMenuItem("仅管理员可操作");
-            noPermItem.setEnabled(false);
-            menu.add(noPermItem);
         }
         menu.show(userList, e.getX(), e.getY());
     }
@@ -604,28 +426,133 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         for (String user : offlineUsers) {
             userListModel.addElement(new UserEntry(user, false));
         }
-        updateUserCount();
+        userCountLabel.setText(onlineUsers.size() + "人在线 · 共"
+                + (onlineUsers.size() + offlineUsers.size()) + "人");
+        // 同步刷新已打开私聊窗口里显示的对方在线状态
+        for (Map.Entry<String, privateChatUI> e : privateWindows.entrySet()) {
+            e.getValue().setPeerOnline(onlineUsers.contains(e.getKey()));
+        }
     }
 
-    private void updateUserCount() {
-        userCountLabel.setText(onlineUsers.size() + "人在线 · 共" + (onlineUsers.size() + offlineUsers.size()) + "人");
+    /** 用户列表条目：用户名 + 在线状态 */
+    private static class UserEntry {
+        final String name;
+        final boolean online;
+
+        UserEntry(String name, boolean online) {
+            this.name = name;
+            this.online = online;
+        }
+    }
+
+    /** 未读数红点徽标 */
+    private static class UnreadBadge extends JLabel {
+        UnreadBadge() {
+            setFont(new Font("Dialog", Font.BOLD, 10));
+            setForeground(Color.WHITE);
+            setHorizontalAlignment(SwingConstants.CENTER);
+            setOpaque(false);
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setColor(chatTheme.UNREAD_RED);
+            g2.fillRoundRect(0, 0, getWidth(), getHeight(), getHeight(), getHeight());
+            g2.dispose();
+            super.paintComponent(g);
+        }
+    }
+
+    /** 用户列表渲染器：头像 + 名字 + 未读徽标 + 在线状态点 */
+    private class UserListCellRenderer extends JPanel implements ListCellRenderer<UserEntry> {
+        private final JLabel avatarLabel;
+        private final JLabel nameLabel;
+        private final JLabel statusLabel;
+        private final UnreadBadge badge;
+
+        UserListCellRenderer() {
+            setLayout(new BorderLayout(10, 0));
+            setBorder(new EmptyBorder(5, 10, 5, 10));
+            setOpaque(true);
+
+            avatarLabel = new JLabel();
+            avatarLabel.setPreferredSize(new Dimension(28, 28));
+            avatarLabel.setHorizontalAlignment(SwingConstants.CENTER);
+            avatarLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 12));
+            avatarLabel.setForeground(Color.WHITE);
+            avatarLabel.setOpaque(true);
+
+            nameLabel = new JLabel();
+            nameLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
+            nameLabel.setForeground(chatTheme.TEXT_DARK);
+
+            badge = new UnreadBadge();
+
+            statusLabel = new JLabel("●");
+            statusLabel.setFont(new Font("Dialog", Font.PLAIN, 10));
+            statusLabel.setForeground(chatTheme.ONLINE_GREEN);
+
+            JPanel rightGroup = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+            rightGroup.setOpaque(false);
+            rightGroup.add(badge);
+            rightGroup.add(statusLabel);
+
+            JPanel centerPanel = new JPanel(new BorderLayout(0, 2));
+            centerPanel.setOpaque(false);
+            centerPanel.add(nameLabel, BorderLayout.CENTER);
+            centerPanel.add(rightGroup, BorderLayout.EAST);
+
+            add(avatarLabel, BorderLayout.WEST);
+            add(centerPanel, BorderLayout.CENTER);
+        }
+
+        @Override
+        public Component getListCellRendererComponent(JList<? extends UserEntry> list, UserEntry value,
+                                                      int index, boolean isSelected, boolean cellHasFocus) {
+            if (value != null) {
+                avatarLabel.setText(value.name.substring(0, 1).toUpperCase());
+                avatarLabel.setBackground(chatTheme.getColorForUser(value.name));
+                nameLabel.setText(value.name);
+                statusLabel.setForeground(value.online ? chatTheme.ONLINE_GREEN : chatTheme.OFFLINE_GRAY);
+                nameLabel.setForeground(value.online ? chatTheme.TEXT_DARK : chatTheme.OFFLINE_TEXT);
+
+                Integer unread = unreadCounts.get(value.name);
+                if (unread != null && unread > 0) {
+                    String text = unread > 99 ? "99+" : String.valueOf(unread);
+                    badge.setText(text);
+                    int width = Math.max(18, 10 + text.length() * 7);
+                    badge.setPreferredSize(new Dimension(width, 16));
+                    badge.setVisible(true);
+                } else {
+                    badge.setVisible(false);
+                }
+            }
+            setBackground(isSelected ? new Color(235, 238, 250) : chatTheme.SIDEBAR_BG);
+            return this;
+        }
     }
 
     private void showExitConfirmation() {
-        int result = JOptionPane.showConfirmDialog(this,
-                "确定要退出聊天室吗？",
-                "退出确认",
-                JOptionPane.YES_NO_OPTION,
-                JOptionPane.QUESTION_MESSAGE);
-
+        int result = JOptionPane.showConfirmDialog(this, "确定要退出聊天室吗？", "退出确认",
+                JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
         if (result == JOptionPane.YES_OPTION) {
-            // 通知服务器自己下线并关闭连接
+            closeAllPrivateWindows();
             client.logout();
             dispose();
             System.exit(0);
-        } else {
-            setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         }
+    }
+
+    /** 连接终止（被踢/被封禁/断线）后的统一收尾：关掉全部窗口并退出进程 */
+    private void shutdownAfter(String title, String reason) {
+        disconnectedNotified = true;
+        chatTheme.appendSystemMessage(chatArea, "⚠️ " + reason);
+        JOptionPane.showMessageDialog(this, reason, title, JOptionPane.WARNING_MESSAGE);
+        closeAllPrivateWindows();
+        dispose();
+        System.exit(0);
     }
 
     // ===== chatClient.Listener 回调（发生在接收线程，统一切回 EDT 更新界面） =====
@@ -642,46 +569,162 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
 
     @Override
     public void onSystemMessage(String content) {
-        SwingUtilities.invokeLater(() -> appendSystemMessage(content));
+        SwingUtilities.invokeLater(() -> chatTheme.appendSystemMessage(chatArea, content));
     }
 
     @Override
     public void onRole(String role) {
         this.role = role;
+        SwingUtilities.invokeLater(() -> clearPublicButton.setVisible("admin".equals(role)));
     }
 
     @Override
     public void onKicked(String reason) {
-        SwingUtilities.invokeLater(() -> {
-            disconnectedNotified = true; // 防止随后的断线回调重复弹窗
-            appendSystemMessage("⚠️ " + reason);
-            JOptionPane.showMessageDialog(this, reason, "已被踢出", JOptionPane.WARNING_MESSAGE);
-            dispose();
-        });
+        SwingUtilities.invokeLater(() -> shutdownAfter("已被踢出", reason));
     }
 
     @Override
     public void onBanned(String reason) {
+        SwingUtilities.invokeLater(() -> shutdownAfter("已被封禁", reason));
+    }
+
+    @Override
+    public void onChatMessage(String sender, long timestamp, String content) {
         SwingUtilities.invokeLater(() -> {
-            disconnectedNotified = true;
-            appendSystemMessage("⚠️ " + reason);
-            JOptionPane.showMessageDialog(this, reason, "已被封禁", JOptionPane.WARNING_MESSAGE);
-            dispose();
+            if (!historyLoaded) {
+                pendingPublic.add(new Object[]{sender, timestamp, content});
+                return;
+            }
+            chatTheme.appendMessage(chatArea, sender, timestamp, content, sender.equals(nickname));
         });
     }
 
     @Override
-    public void onChatMessage(String sender, String content) {
-        SwingUtilities.invokeLater(() -> appendMessage(content, sender, sender.equals(nickname)));
+    public void onPublicHistoryBegin() {
+        SwingUtilities.invokeLater(() -> {
+            chatArea.setText("");
+            historyLoaded = false;
+        });
+    }
+
+    @Override
+    public void onPublicHistoryItem(String sender, long timestamp, String content) {
+        SwingUtilities.invokeLater(() ->
+                chatTheme.appendMessage(chatArea, sender, timestamp, content, sender.equals(nickname)));
+    }
+
+    @Override
+    public void onPublicHistoryEnd() {
+        SwingUtilities.invokeLater(this::finishHistoryLoad);
+    }
+
+    @Override
+    public void onPublicCleared(String operator) {
+        SwingUtilities.invokeLater(() -> {
+            chatArea.setText("");
+            chatTheme.appendSystemMessage(chatArea,
+                    "公共聊天记录已被管理员「" + operator + "」清空");
+        });
+    }
+
+    @Override
+    public void onPrivateMessage(String peer, String sender, long timestamp,
+                                 int unread, String content) {
+        SwingUtilities.invokeLater(() -> {
+            privateChatUI window = privateWindows.get(peer);
+            boolean windowOpen = window != null && window.isDisplayable();
+            if (windowOpen) {
+                window.appendMessage(sender, timestamp, content);
+                if (!sender.equals(nickname)) {
+                    // 窗口开着就当即读掉，服务端那份未读标记也要同步清掉
+                    client.markPrivateRead(peer);
+                    clearUnread(peer);
+                }
+                return;
+            }
+            if (sender.equals(nickname)) {
+                return; // 自己发出的回显，窗口却已关闭，无须提示
+            }
+            // 未读数直接用服务端给的权威值，不做本地自增，
+            // 免得和随后到达的 UNREAD 汇总互相覆盖
+            setUnread(peer, unread);
+        });
+    }
+
+    @Override
+    public void onPrivateHistoryBegin(String peer) {
+        SwingUtilities.invokeLater(() -> {
+            privateChatUI w = privateWindows.get(peer);
+            if (w != null) {
+                w.onHistoryBegin();
+            }
+        });
+    }
+
+    @Override
+    public void onPrivateHistoryItem(String peer, String sender, long timestamp, String content) {
+        SwingUtilities.invokeLater(() -> {
+            privateChatUI w = privateWindows.get(peer);
+            if (w != null) {
+                w.onHistoryItem(sender, timestamp, content);
+            }
+        });
+    }
+
+    @Override
+    public void onPrivateHistoryEnd(String peer) {
+        SwingUtilities.invokeLater(() -> {
+            privateChatUI w = privateWindows.get(peer);
+            if (w != null) {
+                w.onHistoryEnd();
+            }
+            clearUnread(peer);
+        });
+    }
+
+    @Override
+    public void onPrivateCleared(String peer) {
+        SwingUtilities.invokeLater(() -> {
+            privateChatUI w = privateWindows.get(peer);
+            if (w != null) {
+                w.onCleared();
+            }
+        });
+    }
+
+    @Override
+    public void onPrivateFail(String peer, String reason) {
+        SwingUtilities.invokeLater(() -> {
+            privateChatUI w = privateWindows.get(peer);
+            if (w != null) {
+                w.markPeerGone(reason);
+            } else {
+                JOptionPane.showMessageDialog(this, reason, "私聊失败", JOptionPane.WARNING_MESSAGE);
+            }
+        });
+    }
+
+    @Override
+    public void onUnreadSummary(Map<String, Integer> counts) {
+        SwingUtilities.invokeLater(() -> {
+            // 取较大值而不是直接覆盖：这份汇总是服务端查询那一刻的快照，
+            // 查询之后、响应到达之前收到的私聊已经通过 PMMSG 把徽标更新过了，
+            // 直接覆盖会把那部分未读抹掉
+            for (Map.Entry<String, Integer> e : counts.entrySet()) {
+                if (privateWindows.containsKey(e.getKey())) {
+                    continue; // 窗口开着的会话已经读过了，快照是过期数据
+                }
+                unreadCounts.merge(e.getKey(), e.getValue(), Math::max);
+            }
+            userList.repaint();
+        });
     }
 
     @Override
     public void onUserList(String[] users) {
         SwingUtilities.invokeLater(() -> {
             onlineUsers.clear();
-            for (String user : users) {
-                onlineUsers.add(user);
-            }
+            java.util.Collections.addAll(onlineUsers, users);
             refreshUserList();
         });
     }
@@ -690,9 +733,7 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     public void onOfflineUsers(String[] users) {
         SwingUtilities.invokeLater(() -> {
             offlineUsers.clear();
-            for (String user : users) {
-                offlineUsers.add(user);
-            }
+            java.util.Collections.addAll(offlineUsers, users);
             refreshUserList();
         });
     }
@@ -703,94 +744,9 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
             if (disconnectedNotified) {
                 return;
             }
-            disconnectedNotified = true;
             connectionStatusLabel.setText("● 已断开");
-            connectionStatusLabel.setForeground(new Color(220, 60, 60));
-            appendSystemMessage("与服务器的连接已断开：" + reason);
-            JOptionPane.showMessageDialog(this, "与服务器的连接已断开：\n" + reason,
-                    "连接断开", JOptionPane.WARNING_MESSAGE);
-            dispose();
-        });
-    }
-
-    // 辅助方法：获取中文字体（微软雅黑支持中文和大部分 emoji）
-    private Font getChatFont(int size) {
-        if (isFontAvailable("Microsoft YaHei")) {
-            return new Font("Microsoft YaHei", Font.PLAIN, size);
-        }
-        return new Font("Dialog", Font.PLAIN, size);
-    }
-
-    // 辅助方法：获取支持Emoji的字体（仅用于只显示 emoji 的按钮）
-    private Font getEmojiFont(int size) {
-        if (isFontAvailable("Segoe UI Emoji")) {
-            return new Font("Segoe UI Emoji", Font.PLAIN, size);
-        } else if (isFontAvailable("Noto Color Emoji")) {
-            return new Font("Noto Color Emoji", Font.PLAIN, size);
-        } else if (isFontAvailable("Apple Color Emoji")) {
-            return new Font("Apple Color Emoji", Font.PLAIN, size);
-        } else {
-            // 使用默认字体，通常也能显示Emoji
-            return new Font("Dialog", Font.PLAIN, size);
-        }
-    }
-
-    // 辅助方法：检查字体是否可用
-    private boolean isFontAvailable(String fontName) {
-        GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
-        String[] fontNames = ge.getAvailableFontFamilyNames();
-        for (String name : fontNames) {
-            if (name.equalsIgnoreCase(fontName)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    public static void main(String[] args) {
-        SwingUtilities.invokeLater(() -> {
-            try {
-                UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-            } catch (Exception ignored) {}
-
-            // 测试入口：直连本机服务器并登录（正式入口是 chatEntryUI）
-            try {
-                chatClient client = new chatClient();
-                client.connect("127.0.0.1", 8080);
-                client.setListener(new chatClient.Listener() {
-                    @Override
-                    public void onLoginResult(boolean ok, String r) {
-                        if (ok) {
-                            new clientChatUI("测试用户", "127.0.0.1", 8080, client).setVisible(true);
-                        } else {
-                            JOptionPane.showMessageDialog(null, "登录失败：" + r,
-                                    "错误", JOptionPane.ERROR_MESSAGE);
-                            System.exit(1);
-                        }
-                    }
-                    @Override
-                    public void onRegisterResult(boolean ok, String r) {}
-                    @Override
-                    public void onSystemMessage(String c) {}
-                    @Override
-                    public void onChatMessage(String s, String c) {}
-                    @Override
-                    public void onUserList(String[] u) {}
-                    @Override
-                    public void onOfflineUsers(String[] u) {}
-                    @Override
-                    public void onDisconnected(String r) {
-                        JOptionPane.showMessageDialog(null, "连接断开：" + r,
-                                "错误", JOptionPane.ERROR_MESSAGE);
-                        System.exit(1);
-                    }
-                });
-                client.login("测试用户", "123456");
-            } catch (IOException e) {
-                JOptionPane.showMessageDialog(null, "无法连接服务器：" + e.getMessage(),
-                        "错误", JOptionPane.ERROR_MESSAGE);
-                System.exit(1);
-            }
+            connectionStatusLabel.setForeground(chatTheme.DANGER);
+            shutdownAfter("连接断开", "与服务器的连接已断开：" + reason);
         });
     }
 }

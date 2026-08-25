@@ -427,7 +427,7 @@ public class chatEntryUI extends JFrame {
                 @Override
                 public void onSystemMessage(String c) {}
                 @Override
-                public void onChatMessage(String s, String c) {}
+                public void onChatMessage(String s, long t, String c) {}
                 @Override
                 public void onUserList(String[] u) {}
                 @Override

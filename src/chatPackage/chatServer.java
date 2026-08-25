@@ -17,6 +17,7 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -34,9 +35,16 @@ import java.util.concurrent.ConcurrentHashMap;
  *  客户端 -> 服务端：
  *    REGISTER:用户名:密码  注册新账号（用户名不能含冒号或逗号）
  *    LOGIN:用户名:密码     登录（验证通过后才算进入聊天室）
- *    MSG:消息内容          发送聊天消息
+ *    MSG:消息内容          发送公共聊天消息
  *    KICK:用户名           管理员踢人（仅管理员有效）
  *    BAN:用户名            管理员封禁并从数据库删除用户（仅管理员有效）
+ *    PM:对方:消息内容       发送私聊（对方在线或离线都可以发）
+ *    PMHIST:对方           拉取与某人的私聊历史（服务端发完历史后标记已读）
+ *    PMREAD:对方           标记与某人的私聊为已读（私聊窗口开着时收到消息后发）
+ *    CLEARPM:对方          清空自己与某人的私聊记录（不影响对方那份）
+ *    CLEARPUBLIC           清空公共聊天记录（仅管理员有效）
+ *    HIST                  拉取公共聊天历史
+ *    UNREAD                拉取未读私聊汇总
  *    LOGOUT                主动退出
  *  服务端 -> 客户端：
  *    REGISTEROK / REGISTERFAIL:原因
@@ -45,9 +53,22 @@ import java.util.concurrent.ConcurrentHashMap;
  *    KICKED:原因            本连接被管理员踢出（随后服务端会关闭连接）
  *    BANNED:原因            本连接被管理员封禁（随后服务端会关闭连接）
  *    SYSTEM:系统消息         通知类消息（有人加入/离开/被踢等）
- *    MSG:昵称:消息内容       普通聊天消息（消息体取第一个冒号之后的部分）
+ *    MSG:昵称:时间戳:内容    公共聊天消息
  *    USERS:昵称1,昵称2       当前在线用户列表
  *    OFFLINEUSERS:昵称1,昵称2 已注册但不在线的用户列表
+ *    HISTBEGIN / HISTITEM:昵称:时间戳:内容 / HISTEND        公共历史回放
+ *    PMMSG:对方:发送者:时间戳:未读数:内容                     私聊消息实时投递
+ *    PMHISTBEGIN:对方 / PMHISTITEM:对方:发送者:时间戳:内容 / PMHISTEND:对方
+ *    UNREAD:对方:数量,对方2:数量2                            未读汇总
+ *    PUBLICCLEARED:操作者    公共记录已被管理员清空
+ *    PMCLEARED:对方          自己与某人的私聊记录已清空
+ *    PMFAIL:对方:原因        私聊操作失败
+ *
+ * 协议约定：
+ *  - 时间戳一律用 epoch millis（纯数字）。若用 HH:mm:ss 会引入冒号，破坏字段分隔。
+ *  - 消息内容固定放在最后一个字段，前面的字段用连续 indexOf(':') 切分。用户名已由
+ *    isValidName 禁止包含冒号和逗号，时间戳和计数是纯数字，因此切分是安全的。
+ *  - 所有内容型消息在入库和广播之前必须经过 sanitize() 清洗，见该方法的注释。
  */
 public class chatServer {
 
@@ -56,6 +77,9 @@ public class chatServer {
 
     /** 服务器在线人数上限 */
     private static final int MAX_USERS = 100;
+
+    /** 单条消息内容长度上限（字符数），超出部分截断 */
+    private static final int MAX_MSG_LEN = 2000;
 
     /** 在线客户端表：昵称 -> 对应的客户端处理线程（含输出流），线程安全 */
     private static final ConcurrentHashMap<String, ClientHandler> clients = new ConcurrentHashMap<>();
@@ -145,6 +169,37 @@ public class chatServer {
     }
 
     /**
+     * 清洗消息内容：限长、去首尾空白、剔除换行符。所有内容型命令（MSG / PM）
+     * 在入库和广播之前都必须过这道关。
+     *
+     * 限长是这里的主要职责：readLine() 会无限缓冲直到遇到行结束符，手工构造的客户端
+     * 可以发一行几十兆的内容把服务端内存撑爆，而 content 列是 TEXT（上限 64KB），
+     * 超长内容写库也会失败。
+     *
+     * 换行符的剔除在当前传输方式下是冗余的——readLine() 把 \r、\n、\r\n 都当作行
+     * 结束符，它返回的字符串里不可能含这两个字符。保留这行是防御性的：一旦以后换成
+     * 别的分帧方式（比如带长度前缀的协议），这里就是唯一的收口。
+     *
+     * 真正防住换行注入的是客户端 chatClient.sendLine 里的同名清洗，原因是那条攻击
+     * 路径出在发送侧：本协议「每行一条命令」，而 Swing 的 JTextField 只把 \n 过滤成
+     * 空格（setDocument 里设了 filterNewlines），\r 会原样留在文本里。于是从 Windows
+     * 文本（CRLF 换行）复制一段话粘进输入框再发出去，服务端 readLine 就会在 \r 处
+     * 断行，把后半段当成一条独立命令执行：
+     *
+     *     用户粘贴 "你好\r\nCLEARPUBLIC"
+     *     经 JTextField 变成 "你好\r CLEARPUBLIC"
+     *     PrintWriter 原样发出，服务端 readLine 得到两行：MSG:你好  和  CLEARPUBLIC
+     *
+     * 发送者若恰好是管理员，一次粘贴就清空了公共聊天记录；KICK、BAN、LOGOUT 同理。
+     * 注意这不是「客户端校验就够了」的反例——直接构造 socket 的攻击者本来就能发送
+     * 任意命令，无需注入，挡住他们的是各命令自身的 isAdmin() 权限校验。
+     */
+    private static String sanitize(String content) {
+        String s = content.replace('\r', ' ').replace('\n', ' ').trim();
+        return s.length() > MAX_MSG_LEN ? s.substring(0, MAX_MSG_LEN) : s;
+    }
+
+    /**
      * 每个客户端连接对应一个 ClientHandler 线程，
      * 在该线程中循环读取客户端发来的每一行消息。
      */
@@ -179,21 +234,41 @@ public class chatServer {
             }
         }
 
-        /** 解析并处理客户端发来的每一条消息 */
+        /**
+         * 解析并处理客户端发来的每一条消息。
+         *
+         * 除注册和登录外，所有命令都必须先确认已登录（nickname != null），
+         * 否则未登录的连接就能直接触发数据库查询。
+         */
         private void handleMessage(String line) {
             if (line.startsWith("REGISTER:")) {
                 handleRegister(line.substring("REGISTER:".length()));
-            } else if (line.startsWith("LOGIN:")) {
+                return;
+            }
+            if (line.startsWith("LOGIN:")) {
                 handleLogin(line.substring("LOGIN:".length()));
-            } else if (line.startsWith("MSG:")) {
-                if (nickname == null) {
-                    return; // 尚未登录成功，忽略消息
-                }
-                String content = line.substring("MSG:".length()).trim();
-                if (!content.isEmpty()) {
-                    broadcast("MSG:" + nickname + ":" + content);
-                    log(nickname + " 说：" + content);
-                }
+                return;
+            }
+            if (nickname == null) {
+                return; // 尚未登录成功，忽略后续所有命令
+            }
+
+            if (line.startsWith("MSG:")) {
+                handlePublicMessage(line.substring("MSG:".length()));
+            } else if (line.startsWith("PMHIST:")) {
+                handlePmHistory(line.substring("PMHIST:".length()).trim());
+            } else if (line.startsWith("PMREAD:")) {
+                handlePmRead(line.substring("PMREAD:".length()).trim());
+            } else if (line.startsWith("PM:")) {
+                handlePrivateMessage(line.substring("PM:".length()));
+            } else if (line.startsWith("CLEARPM:")) {
+                handleClearPm(line.substring("CLEARPM:".length()).trim());
+            } else if (line.equals("CLEARPUBLIC")) {
+                handleClearPublic();
+            } else if (line.equals("HIST")) {
+                handlePublicHistory();
+            } else if (line.equals("UNREAD")) {
+                handleUnread();
             } else if (line.startsWith("KICK:")) {
                 handleKick(line.substring("KICK:".length()).trim());
             } else if (line.startsWith("BAN:")) {
@@ -201,6 +276,29 @@ public class chatServer {
             } else if (line.equals("LOGOUT")) {
                 disconnect(); // 主动退出，关闭连接后读取循环自然结束
             }
+        }
+
+        /**
+         * 公共聊天消息：先入库再广播。
+         *
+         * 入库失败时不广播（fail-closed），保证「历史里有的都广播过，广播过的都在历史里」
+         * 这个不变式——否则重登后会看到一份和当时界面对不上的记录。
+         */
+        private void handlePublicMessage(String rest) {
+            String content = sanitize(rest);
+            if (content.isEmpty()) {
+                return;
+            }
+            long ts;
+            try {
+                ts = db.savePublicMessage(nickname, content);
+            } catch (SQLException e) {
+                System.err.println("保存公共消息失败：" + e.getMessage());
+                sendTo(this, "SYSTEM:消息发送失败，请稍后重试");
+                return;
+            }
+            broadcast("MSG:" + nickname + ":" + ts + ":" + content);
+            log(nickname + " 说：" + content);
         }
 
         /** 当前连接是否为管理员 */
@@ -244,7 +342,8 @@ public class chatServer {
                 return;
             }
             try {
-                boolean deleted = db.deleteUser(target);
+                // 事务：私聊记录和账号一起删，避免留下清不掉的孤儿行
+                boolean deleted = db.banUser(target);
                 if (!deleted) {
                     sendTo(this, "SYSTEM:用户「" + target + "」不存在");
                     return;
@@ -262,6 +361,210 @@ public class chatServer {
             broadcast("SYSTEM:" + target + " 已被管理员 " + nickname + " 封禁（账号已删除）");
             broadcastOfflineUsers(); // 数据库变化，刷新离线用户列表
             log(nickname + " 封禁并删除用户 " + target);
+        }
+
+        // ===== 私聊 =====
+
+        /**
+         * 私聊目标合法性校验，不合法时回 PMFAIL 并返回 false。
+         *
+         * 禁止给自己发私聊：双份行模型下 owner 和 peer 都会是自己，PMHIST 查询
+         * 「owner=我 AND peer=我」会让每条消息命中两行，历史里全部重复显示。
+         * 界面上右键菜单对自己不弹出（clientChatUI.showUserPopup），但手工构造
+         * PM:自己:内容 能绕过，所以服务端必须自己挡住。
+         */
+        private boolean checkPeer(String target) {
+            if (target.isEmpty() || !isValidName(target)) {
+                sendTo(this, "PMFAIL:" + target + ":用户名不合法");
+                return false;
+            }
+            if (target.equals(nickname)) {
+                sendTo(this, "PMFAIL:" + target + ":不能给自己发私聊");
+                return false;
+            }
+            try {
+                if (!db.userExists(target)) {
+                    sendTo(this, "PMFAIL:" + target + ":用户「" + target + "」不存在或已注销");
+                    return false;
+                }
+            } catch (SQLException e) {
+                System.err.println("校验私聊对象失败：" + e.getMessage());
+                sendTo(this, "PMFAIL:" + target + ":服务器内部错误");
+                return false;
+            }
+            return true;
+        }
+
+        /**
+         * 发送私聊：PM:对方:内容
+         *
+         * 对方离线时消息仍然入库，等对方上线拉历史时能看到；这里额外给发送方回一条
+         * 系统提示，否则发送方无法区分「已实时送达」和「石沉大海」。
+         */
+        private void handlePrivateMessage(String rest) {
+            int colon = rest.indexOf(':');
+            if (colon < 0) {
+                sendTo(this, "PMFAIL::私聊格式错误");
+                return;
+            }
+            String target = rest.substring(0, colon).trim();
+            String content = sanitize(rest.substring(colon + 1));
+            if (content.isEmpty()) {
+                return;
+            }
+            if (!checkPeer(target)) {
+                return;
+            }
+
+            long ts;
+            try {
+                ts = db.savePrivateMessage(nickname, target, content);
+            } catch (SQLException e) {
+                System.err.println("保存私聊消息失败：" + e.getMessage());
+                sendTo(this, "PMFAIL:" + target + ":发送失败，请稍后重试");
+                return;
+            }
+
+            // 回显给发送者：会话对方是 target，自己的副本没有未读概念，计数固定 0
+            sendTo(this, "PMMSG:" + target + ":" + nickname + ":" + ts + ":0:" + content);
+
+            ClientHandler peer = clients.get(target);
+            if (peer != null) {
+                // 投递给接收者：会话对方是发送者。未读数取服务端权威值，
+                // 客户端直接显示这个数而不做本地自增，避免与 UNREAD 汇总互相覆盖。
+                int unread;
+                try {
+                    unread = db.countUnread(target, nickname);
+                } catch (SQLException e) {
+                    unread = 0;
+                }
+                sendTo(peer, "PMMSG:" + nickname + ":" + nickname + ":" + ts + ":" + unread + ":" + content);
+            } else {
+                sendTo(this, "SYSTEM:「" + target + "」当前离线，消息将在其上线后送达");
+            }
+            log(nickname + " 私聊 " + target + "：" + content);
+        }
+
+        /**
+         * 拉取私聊历史：PMHIST:对方
+         *
+         * 顺序必须是「先查历史发出去，再标记已读」。若反过来先标记已读，
+         * 在 UPDATE 之后 SELECT 之前插入的新消息会被查出来显示，但它的 is_read 仍是 0，
+         * 下次登录就会出现幽灵未读。
+         */
+        private void handlePmHistory(String target) {
+            if (!checkPeer(target)) {
+                // 即使失败也要给出结束标记，否则客户端窗口永远卡在加载中
+                sendTo(this, "PMHISTBEGIN:" + target);
+                sendTo(this, "PMHISTEND:" + target);
+                return;
+            }
+            List<dbManager.ChatRecord> history;
+            try {
+                history = db.getPrivateHistory(nickname, target, dbManager.PRIVATE_HISTORY_LIMIT);
+            } catch (SQLException e) {
+                System.err.println("读取私聊历史失败：" + e.getMessage());
+                sendTo(this, "PMHISTBEGIN:" + target);
+                sendTo(this, "PMHISTEND:" + target);
+                return;
+            }
+            sendTo(this, "PMHISTBEGIN:" + target);
+            for (dbManager.ChatRecord r : history) {
+                sendTo(this, "PMHISTITEM:" + target + ":" + r.sender + ":" + r.timestamp + ":" + r.content);
+            }
+            sendTo(this, "PMHISTEND:" + target);
+
+            try {
+                db.markPrivateRead(nickname, target);
+            } catch (SQLException e) {
+                System.err.println("标记私聊已读失败：" + e.getMessage());
+            }
+        }
+
+        /** 标记已读：PMREAD:对方（私聊窗口开着时收到新消息后由客户端发来） */
+        private void handlePmRead(String target) {
+            if (target.isEmpty() || target.equals(nickname)) {
+                return;
+            }
+            try {
+                db.markPrivateRead(nickname, target);
+            } catch (SQLException e) {
+                System.err.println("标记私聊已读失败：" + e.getMessage());
+            }
+        }
+
+        /**
+         * 清空自己与某人的私聊记录：CLEARPM:对方
+         * 只删自己那份，对方持有的副本不受影响。
+         */
+        private void handleClearPm(String target) {
+            if (target.isEmpty() || target.equals(nickname)) {
+                return;
+            }
+            try {
+                int n = db.clearPrivateHistory(nickname, target);
+                sendTo(this, "PMCLEARED:" + target);
+                log(nickname + " 清空了与 " + target + " 的私聊记录（" + n + " 条）");
+            } catch (SQLException e) {
+                System.err.println("清空私聊记录失败：" + e.getMessage());
+                sendTo(this, "PMFAIL:" + target + ":清空失败，请稍后重试");
+            }
+        }
+
+        // ===== 历史与未读 =====
+
+        /** 拉取公共聊天历史：HIST */
+        private void handlePublicHistory() {
+            List<dbManager.ChatRecord> history;
+            try {
+                history = db.getPublicHistory(dbManager.PUBLIC_HISTORY_LIMIT);
+            } catch (SQLException e) {
+                System.err.println("读取公共历史失败：" + e.getMessage());
+                // 仍然要发出结束标记，客户端才会退出加载状态
+                sendTo(this, "HISTBEGIN");
+                sendTo(this, "HISTEND");
+                return;
+            }
+            sendTo(this, "HISTBEGIN");
+            for (dbManager.ChatRecord r : history) {
+                sendTo(this, "HISTITEM:" + r.sender + ":" + r.timestamp + ":" + r.content);
+            }
+            sendTo(this, "HISTEND");
+        }
+
+        /** 拉取未读私聊汇总：UNREAD */
+        private void handleUnread() {
+            try {
+                Map<String, Integer> summary = db.getUnreadSummary(nickname);
+                StringBuilder sb = new StringBuilder("UNREAD:");
+                boolean first = true;
+                for (Map.Entry<String, Integer> e : summary.entrySet()) {
+                    if (!first) {
+                        sb.append(',');
+                    }
+                    sb.append(e.getKey()).append(':').append(e.getValue());
+                    first = false;
+                }
+                sendTo(this, sb.toString());
+            } catch (SQLException e) {
+                System.err.println("读取未读汇总失败：" + e.getMessage());
+            }
+        }
+
+        /** 管理员清空公共聊天记录：CLEARPUBLIC */
+        private void handleClearPublic() {
+            if (!isAdmin()) {
+                sendTo(this, "SYSTEM:无权限执行此操作");
+                return;
+            }
+            try {
+                int n = db.clearPublicMessages();
+                broadcast("PUBLICCLEARED:" + nickname);
+                log(nickname + " 清空了公共聊天记录（" + n + " 条）");
+            } catch (SQLException e) {
+                System.err.println("清空公共记录失败：" + e.getMessage());
+                sendTo(this, "SYSTEM:清空失败，请稍后重试");
+            }
         }
 
         /** 注册：REGISTER:用户名:密码 */

@@ -8,6 +8,8 @@ import java.io.PrintWriter;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * 聊天室客户端网络层（与 chatServer 配对的客户端类）
@@ -31,7 +33,7 @@ public class chatClient {
         void onLoginResult(boolean success, String reason);   // LOGINOK / LOGINFAIL:原因
         void onRegisterResult(boolean success, String reason); // REGISTEROK / REGISTERFAIL:原因
         void onSystemMessage(String content);          // SYSTEM:xxx 系统消息
-        void onChatMessage(String sender, String content); // MSG:昵称:内容 聊天消息
+        void onChatMessage(String sender, long timestamp, String content); // MSG:昵称:时间戳:内容
         void onUserList(String[] users);               // USERS:... 在线用户列表
         void onOfflineUsers(String[] users);           // OFFLINEUSERS:... 离线用户列表
         void onDisconnected(String reason);            // 连接断开（异常/被服务器关闭/主动退出）
@@ -44,6 +46,40 @@ public class chatClient {
 
         /** 本连接被管理员封禁（账号已删除） */
         default void onBanned(String reason) {}
+
+        // ===== 公共聊天历史回放 =====
+
+        default void onPublicHistoryBegin() {}
+        default void onPublicHistoryItem(String sender, long timestamp, String content) {}
+        default void onPublicHistoryEnd() {}
+
+        /** 公共聊天记录已被管理员清空 */
+        default void onPublicCleared(String operator) {}
+
+        // ===== 私聊 =====
+
+        /**
+         * 收到一条私聊消息。
+         *
+         * @param peer      会话对方（自己发出的消息里是接收者，收到的消息里是发送者）
+         * @param sender    实际发送者
+         * @param unread    服务端给出的权威未读数，客户端直接显示这个值，不要本地自增
+         */
+        default void onPrivateMessage(String peer, String sender, long timestamp,
+                                      int unread, String content) {}
+
+        default void onPrivateHistoryBegin(String peer) {}
+        default void onPrivateHistoryItem(String peer, String sender, long timestamp, String content) {}
+        default void onPrivateHistoryEnd(String peer) {}
+
+        /** 自己与某人的私聊记录已清空 */
+        default void onPrivateCleared(String peer) {}
+
+        /** 私聊操作失败（对方不存在、发送失败等） */
+        default void onPrivateFail(String peer, String reason) {}
+
+        /** 未读私聊汇总：对方用户名 -> 未读条数 */
+        default void onUnreadSummary(Map<String, Integer> counts) {}
     }
 
     /** 连接超时时间（毫秒），局域网连接不上时避免长时间卡住 */
@@ -123,6 +159,41 @@ public class chatClient {
         sendLine("BAN:" + username);
     }
 
+    /** 发送一条私聊消息（对方在线或离线都可以发） */
+    public void sendPrivate(String peer, String content) {
+        sendLine("PM:" + peer + ":" + content);
+    }
+
+    /** 拉取与某人的私聊历史，结果通过 onPrivateHistoryBegin/Item/End 回调 */
+    public void requestPrivateHistory(String peer) {
+        sendLine("PMHIST:" + peer);
+    }
+
+    /** 标记与某人的私聊为已读（私聊窗口开着时收到新消息后调用） */
+    public void markPrivateRead(String peer) {
+        sendLine("PMREAD:" + peer);
+    }
+
+    /** 清空自己与某人的私聊记录（不影响对方那份） */
+    public void clearPrivateHistory(String peer) {
+        sendLine("CLEARPM:" + peer);
+    }
+
+    /** 管理员：清空公共聊天记录 */
+    public void clearPublicHistory() {
+        sendLine("CLEARPUBLIC");
+    }
+
+    /** 拉取公共聊天历史，结果通过 onPublicHistoryBegin/Item/End 回调 */
+    public void requestPublicHistory() {
+        sendLine("HIST");
+    }
+
+    /** 拉取未读私聊汇总，结果通过 onUnreadSummary 回调 */
+    public void requestUnread() {
+        sendLine("UNREAD");
+    }
+
     /** 主动退出：发送 LOGOUT 并关闭连接 */
     public void logout() {
         try {
@@ -133,15 +204,80 @@ public class chatClient {
         }
     }
 
+    /**
+     * 发送一行协议消息。所有发送都经过这里，因此在这里统一剔除换行符。
+     *
+     * 协议是「每行一条命令」，服务端 readLine() 会把 \r、\n、\r\n 都当行结束符。
+     * 内容里混进换行符就会被拆成两行，后半段被服务端当成独立命令执行（详见
+     * chatServer.sanitize 的注释）。注意 JTextField 只过滤 \n 不过滤 \r，
+     * 所以从 Windows 文本粘贴的内容确实会带 \r 过来。
+     *
+     * 这层只是客户端兜底，真正的收口在服务端——手工构造 socket 可以绕过这里。
+     */
     private void sendLine(String line) {
         if (!connected || out == null) {
             return;
         }
-        out.println(line);
+        out.println(line.replace('\r', ' ').replace('\n', ' '));
         if (out.checkError()) {
             // 写入失败说明连接已断开
             onDisconnect("发送消息失败，连接已断开");
         }
+    }
+
+    /**
+     * 按固定字段数切分协议消息：返回长度为 n+1 的数组，前 n 个是冒号分隔的固定字段，
+     * 最后一个是第 n 个冒号之后的全部内容（可以包含冒号）。字段不足时返回 null。
+     *
+     * 不能用 line.split(":")：消息内容里的冒号会被当成分隔符，把内容截断。
+     * 用户名已由服务端禁止包含冒号，时间戳和计数是纯数字，所以前面的字段切分是安全的。
+     *
+     * @param body 已经去掉命令前缀的部分
+     * @param n    内容之前的固定字段个数
+     */
+    private static String[] splitFixed(String body, int n) {
+        String[] parts = new String[n + 1];
+        int from = 0;
+        for (int i = 0; i < n; i++) {
+            int colon = body.indexOf(':', from);
+            if (colon < 0) {
+                return null;
+            }
+            parts[i] = body.substring(from, colon);
+            from = colon + 1;
+        }
+        parts[n] = body.substring(from);
+        return parts;
+    }
+
+    /** 解析纯数字字段，非法时返回 fallback（防御损坏或跨版本的消息） */
+    private static long parseLong(String s, long fallback) {
+        try {
+            return Long.parseLong(s.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    /**
+     * 解析未读汇总：对方:数量,对方2:数量2
+     *
+     * 分隔符用逗号和冒号而不是等号：等号是合法用户名字符（服务端 isValidName 只禁了
+     * 冒号和逗号），用 a=3 的形式遇到名字里带等号的用户就无法无歧义解析了。
+     */
+    private static Map<String, Integer> parseUnread(String body) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        if (body.isEmpty()) {
+            return counts;
+        }
+        for (String pair : body.split(",")) {
+            int colon = pair.lastIndexOf(':');
+            if (colon <= 0) {
+                continue;
+            }
+            counts.put(pair.substring(0, colon), (int) parseLong(pair.substring(colon + 1), 0L));
+        }
+        return counts;
     }
 
     /** 接收线程：持续读取服务端发来的每一行消息 */
@@ -181,14 +317,50 @@ public class chatClient {
         } else if (line.startsWith("SYSTEM:")) {
             listener.onSystemMessage(line.substring("SYSTEM:".length()));
         } else if (line.startsWith("MSG:")) {
-            // MSG:昵称:内容 —— 取第一个冒号做分隔符，消息内容本身可以含冒号
-            int colon = line.indexOf(':', "MSG:".length());
-            if (colon < 0) {
-                return;
+            // MSG:昵称:时间戳:内容
+            String[] p = splitFixed(line.substring("MSG:".length()), 2);
+            if (p != null) {
+                listener.onChatMessage(p[0], parseLong(p[1], System.currentTimeMillis()), p[2]);
             }
-            String sender = line.substring("MSG:".length(), colon);
-            String content = line.substring(colon + 1);
-            listener.onChatMessage(sender, content);
+        } else if (line.equals("HISTBEGIN")) {
+            listener.onPublicHistoryBegin();
+        } else if (line.startsWith("HISTITEM:")) {
+            // HISTITEM:昵称:时间戳:内容
+            String[] p = splitFixed(line.substring("HISTITEM:".length()), 2);
+            if (p != null) {
+                listener.onPublicHistoryItem(p[0], parseLong(p[1], 0L), p[2]);
+            }
+        } else if (line.equals("HISTEND")) {
+            listener.onPublicHistoryEnd();
+        } else if (line.startsWith("PUBLICCLEARED:")) {
+            listener.onPublicCleared(line.substring("PUBLICCLEARED:".length()));
+        } else if (line.startsWith("PMMSG:")) {
+            // PMMSG:对方:发送者:时间戳:未读数:内容
+            String[] p = splitFixed(line.substring("PMMSG:".length()), 4);
+            if (p != null) {
+                listener.onPrivateMessage(p[0], p[1], parseLong(p[2], System.currentTimeMillis()),
+                        (int) parseLong(p[3], 0L), p[4]);
+            }
+        } else if (line.startsWith("PMHISTBEGIN:")) {
+            listener.onPrivateHistoryBegin(line.substring("PMHISTBEGIN:".length()));
+        } else if (line.startsWith("PMHISTITEM:")) {
+            // PMHISTITEM:对方:发送者:时间戳:内容
+            String[] p = splitFixed(line.substring("PMHISTITEM:".length()), 3);
+            if (p != null) {
+                listener.onPrivateHistoryItem(p[0], p[1], parseLong(p[2], 0L), p[3]);
+            }
+        } else if (line.startsWith("PMHISTEND:")) {
+            listener.onPrivateHistoryEnd(line.substring("PMHISTEND:".length()));
+        } else if (line.startsWith("PMCLEARED:")) {
+            listener.onPrivateCleared(line.substring("PMCLEARED:".length()));
+        } else if (line.startsWith("PMFAIL:")) {
+            // PMFAIL:对方:原因
+            String[] p = splitFixed(line.substring("PMFAIL:".length()), 1);
+            if (p != null) {
+                listener.onPrivateFail(p[0], p[1]);
+            }
+        } else if (line.startsWith("UNREAD:")) {
+            listener.onUnreadSummary(parseUnread(line.substring("UNREAD:".length())));
         } else if (line.startsWith("USERS:")) {
             String list = line.substring("USERS:".length());
             String[] users = list.isEmpty() ? new String[0] : list.split(",");
