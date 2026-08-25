@@ -5,11 +5,13 @@ import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.event.*;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
 /**
  * 主聊天窗口：公共聊天室 + 用户列表 + 私聊入口。
@@ -18,19 +20,20 @@ import java.util.concurrent.ConcurrentHashMap;
  * 因此所有消息都先到这里，再由这里路由到对应的私聊窗口。privateChatUI 不允许自己
  * 注册监听器，否则主窗口会立刻失去全部回调。
  *
- * 线程约定：chatClient 的回调发生在网络接收线程上，所有回调实现都用
- * SwingUtilities.invokeLater 切回 EDT 之后再碰界面和下面这两张表。
+ * 消息渲染使用 bubbleChatList（微信风格气泡）。线程约定：chatClient 的回调发生在网络
+ * 接收线程上，所有回调实现都用 SwingUtilities.invokeLater 切回 EDT 之后再碰界面。
  */
-public class clientChatUI extends JFrame implements chatClient.Listener {
+public class clientChatUI extends JFrame implements chatClient.Listener, bubbleChatList.MenuHandler {
 
     /** 公共历史加载超时，服务端中途断开时不至于让界面一直空着 */
     private static final int HISTORY_TIMEOUT_MS = 10_000;
 
     // UI组件
-    private JTextPane chatArea;
+    private bubbleChatList chatList;
     private JTextField inputField;
     private JButton emojiButton;
     private JButton clearPublicButton;
+    private JTextField searchField;
     private JLabel connectionStatusLabel;
     private JLabel userCountLabel;
 
@@ -66,8 +69,19 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
      * 跨行顺序没有保证，不缓冲就会出现重复或乱序。
      */
     private boolean historyLoaded;
-    private final List<Object[]> pendingPublic = new ArrayList<>();
+    private final List<Object[]> pendingPublic = new ArrayList<>(); // {sender, msgId, ts, content}
+    private final Set<String> recalledDuringLoad = ConcurrentHashMap.newKeySet();
     private Timer historyTimeout;
+
+    // 被 @ 提醒
+    private Timer flashTimer;
+    private final String normalTitle;
+
+    // 搜索
+    private searchDialog activeSearchDialog;
+
+    // 检测内容里是否 @ 了自己（Unicode 词边界：Java 的 \w 不含中文，会误报「张三」对「张」）
+    private final Pattern mentionPattern;
 
     private JPopupMenu emojiPopup;
 
@@ -76,6 +90,9 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         this.serverIP = serverIP;
         this.serverPort = serverPort;
         this.client = client;
+        this.normalTitle = "局域网聊天室 - " + nickname;
+        this.mentionPattern = Pattern.compile("(?<![\\p{L}\\p{N}_])" + Pattern.quote("@" + nickname)
+                + "(?![\\p{L}\\p{N}_])");
         // 注册消息回调（回调发生在接收线程，实现里统一用 invokeLater 切回 EDT 更新界面）
         // 注意：登录验证已在登录界面完成，这里只接管消息渲染，不能再调用 login()
         client.setListener(this);
@@ -84,10 +101,10 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     }
 
     private void initUI() {
-        setTitle("局域网聊天室 - " + nickname);
+        setTitle(normalTitle);
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
-        setSize(900, 650);
-        setMinimumSize(new Dimension(800, 600));
+        setSize(1150, 750);
+        setMinimumSize(new Dimension(1000, 650));
         setLocationRelativeTo(null);
 
         JPanel mainPanel = new JPanel(new BorderLayout());
@@ -96,7 +113,7 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
 
         JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT,
                 createChatPanel(), createOnlineUsersPanel());
-        splitPane.setDividerLocation(650);
+        splitPane.setDividerLocation(900); // 1150 宽下聊天区约 900、侧边栏约 250
         splitPane.setDividerSize(1);
         splitPane.setBorder(null);
         splitPane.setEnabled(false);
@@ -112,6 +129,14 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
             public void windowClosing(WindowEvent e) {
                 showExitConfirmation();
             }
+            @Override
+            public void windowActivated(WindowEvent e) {
+                stopFlash();
+            }
+            @Override
+            public void windowClosed(WindowEvent e) {
+                stopFlash();
+            }
         });
     }
 
@@ -123,7 +148,6 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
                 new EmptyBorder(12, 20, 12, 20)
         ));
 
-        // 左侧：标题和连接信息
         JPanel leftPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
         leftPanel.setOpaque(false);
 
@@ -139,7 +163,6 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
 
         topBar.add(leftPanel, BorderLayout.WEST);
 
-        // 右侧：管理员操作 + 用户信息
         JPanel rightPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
         rightPanel.setOpaque(false);
 
@@ -172,9 +195,42 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     private JPanel createChatPanel() {
         JPanel chatPanel = new JPanel(new BorderLayout());
         chatPanel.setBackground(chatTheme.CARD_BG);
-        chatArea = chatTheme.createChatPane();
-        chatPanel.add(chatTheme.wrapScroll(chatArea), BorderLayout.CENTER);
+
+        chatList = new bubbleChatList(this);
+
+        // 搜索栏
+        JPanel searchBar = new JPanel(new BorderLayout(8, 0));
+        searchBar.setBackground(chatTheme.CARD_BG);
+        searchBar.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 1, 0, chatTheme.BORDER),
+                new EmptyBorder(8, 12, 8, 12)
+        ));
+        searchField = chatTheme.createInputField();
+        searchField.putClientProperty("JTextField.placeholderText", "搜索公共聊天记录，回车执行");
+        searchField.addActionListener(e -> doSearch());
+        searchBar.add(searchField, BorderLayout.CENTER);
+        JButton searchButton = chatTheme.createStyledButton("搜索", chatTheme.PRIMARY,
+                Color.WHITE, chatTheme.PRIMARY_HOVER);
+        searchButton.setPreferredSize(new Dimension(64, 34));
+        searchButton.addActionListener(e -> doSearch());
+        searchBar.add(searchButton, BorderLayout.EAST);
+
+        chatPanel.add(searchBar, BorderLayout.NORTH);
+        chatPanel.add(chatList, BorderLayout.CENTER);
         return chatPanel;
+    }
+
+    private void doSearch() {
+        String keyword = searchField.getText().trim();
+        if (keyword.isEmpty()) {
+            return;
+        }
+        // 每次搜索换新弹窗：同一时刻只有一个公共搜索在进行，旧弹窗直接关掉
+        if (activeSearchDialog != null) {
+            activeSearchDialog.dispose();
+        }
+        activeSearchDialog = new searchDialog(this, "公共聊天记录搜索：\"" + keyword + "\"");
+        client.searchPublic(keyword);
     }
 
     private JPanel createOnlineUsersPanel() {
@@ -218,8 +274,7 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
             public void mouseReleased(MouseEvent e) { showUserPopup(e); }
             @Override
             public void mouseClicked(MouseEvent e) {
-                // 双击直接开私聊：看到未读红点的人第一反应就是双击，
-                // 只做右键入口会让红点变成点不开的摆设
+                // 双击直接开私聊：看到未读红点的人第一反应就是双击
                 if (e.getClickCount() == 2 && SwingUtilities.isLeftMouseButton(e)) {
                     UserEntry entry = entryAt(e.getPoint());
                     if (entry != null && !entry.name.equals(nickname)) {
@@ -275,6 +330,7 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     private void beginHistoryLoad() {
         historyLoaded = false;
         pendingPublic.clear();
+        recalledDuringLoad.clear();
         client.requestPublicHistory();
         client.requestUnread();
 
@@ -292,13 +348,13 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
             historyTimeout.stop();
         }
         for (Object[] m : pendingPublic) {
-            chatTheme.appendMessage(chatArea, (String) m[0], (Long) m[1], (String) m[2],
-                    ((String) m[0]).equals(nickname));
+            appendPublicMessage((String) m[0], (String) m[1], (Long) m[2], (String) m[3]);
         }
         pendingPublic.clear();
+        recalledDuringLoad.clear();
         historyLoaded = true;
-        chatTheme.appendSystemMessage(chatArea, "欢迎 " + nickname + " 加入聊天室！");
-        chatTheme.appendSystemMessage(chatArea, "您已连接到服务器 " + serverIP + ":" + serverPort);
+        chatList.addSystem("欢迎 " + nickname + " 加入聊天室！", false);
+        chatList.addSystem("您已连接到服务器 " + serverIP + ":" + serverPort, false);
     }
 
     private void confirmClearPublic() {
@@ -310,13 +366,37 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         }
     }
 
+    // ===== 气泡：构造与撤回 =====
+
+    /** 构造一个公共消息气泡（带 @ 高亮判断） */
+    private bubbleChatList.BubbleMsg makePublicBubble(String sender, String msgId,
+                                                      long timestamp, String content) {
+        boolean mine = sender.equals(nickname);
+        boolean canRecall = !msgId.isEmpty() && (mine || "admin".equals(role));
+        String mention = mentionPattern.matcher(content).find() ? nickname : null;
+        return bubbleChatList.bubble(sender, msgId, timestamp, content, mine, canRecall, mention);
+    }
+
+    private void appendPublicMessage(String sender, String msgId, long timestamp, String content) {
+        // 历史加载期间被撤回的消息不渲染（撤回事件可能早于/穿插在历史条目中间到达）
+        if (recalledDuringLoad.contains(msgId)) {
+            return;
+        }
+        chatList.addMessage(makePublicBubble(sender, msgId, timestamp, content));
+    }
+
+    @Override
+    public boolean canRecall(bubbleChatList.BubbleMsg msg) {
+        return msg.canRecall;
+    }
+
+    @Override
+    public void onRecall(bubbleChatList.BubbleMsg msg) {
+        client.recall(msg.msgId);
+    }
+
     // ===== 私聊窗口管理 =====
 
-    /**
-     * 打开（或前置已打开的）与某人的私聊窗口。
-     * 必须在 EDT 上调用——窗口创建可能由用户点击触发，也可能由收到消息触发，
-     * 统一在 EDT 上做才不会为同一个人建出两个窗口。
-     */
     private privateChatUI openPrivateChat(String peer) {
         privateChatUI window = privateWindows.get(peer);
         if (window == null || !window.isDisplayable()) {
@@ -363,7 +443,6 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
 
     // ===== 用户列表 =====
 
-    /** 取鼠标位置对应的用户条目，点在空白处返回 null */
     private UserEntry entryAt(Point p) {
         int index = userList.locationToIndex(p);
         if (index < 0) {
@@ -385,7 +464,7 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         }
         UserEntry entry = entryAt(e.getPoint());
         if (entry == null || entry.name.equals(nickname)) {
-            return; // 空白处或自己，不弹菜单
+            return;
         }
         userList.setSelectedValue(entry, false);
 
@@ -417,7 +496,6 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         menu.show(userList, e.getX(), e.getY());
     }
 
-    /** 按在线优先的顺序重建合并用户列表 */
     private void refreshUserList() {
         userListModel.clear();
         for (String user : onlineUsers) {
@@ -428,13 +506,11 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         }
         userCountLabel.setText(onlineUsers.size() + "人在线 · 共"
                 + (onlineUsers.size() + offlineUsers.size()) + "人");
-        // 同步刷新已打开私聊窗口里显示的对方在线状态
         for (Map.Entry<String, privateChatUI> e : privateWindows.entrySet()) {
             e.getValue().setPeerOnline(onlineUsers.contains(e.getKey()));
         }
     }
 
-    /** 用户列表条目：用户名 + 在线状态 */
     private static class UserEntry {
         final String name;
         final boolean online;
@@ -534,6 +610,35 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
         }
     }
 
+    // ===== 被 @ 提醒 =====
+
+    private void flashAttention() {
+        chatTheme.playBeep();
+        if (flashTimer != null) {
+            flashTimer.stop();
+        }
+        setState(Frame.NORMAL);
+        toFront();
+        final int[] toggles = {10}; // 10 次 × 500ms = 5 秒
+        flashTimer = new Timer(500, null);
+        flashTimer.addActionListener(e -> {
+            if (toggles[0]-- <= 0) {
+                stopFlash();
+                return;
+            }
+            setTitle(toggles[0] % 2 == 0 ? "【有人@你】" + normalTitle : normalTitle);
+        });
+        flashTimer.start();
+    }
+
+    private void stopFlash() {
+        if (flashTimer != null) {
+            flashTimer.stop();
+            flashTimer = null;
+        }
+        setTitle(normalTitle);
+    }
+
     private void showExitConfirmation() {
         int result = JOptionPane.showConfirmDialog(this, "确定要退出聊天室吗？", "退出确认",
                 JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
@@ -548,7 +653,7 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     /** 连接终止（被踢/被封禁/断线）后的统一收尾：关掉全部窗口并退出进程 */
     private void shutdownAfter(String title, String reason) {
         disconnectedNotified = true;
-        chatTheme.appendSystemMessage(chatArea, "⚠️ " + reason);
+        chatList.addSystem("⚠️ " + reason, false);
         JOptionPane.showMessageDialog(this, reason, title, JOptionPane.WARNING_MESSAGE);
         closeAllPrivateWindows();
         dispose();
@@ -569,13 +674,18 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
 
     @Override
     public void onSystemMessage(String content) {
-        SwingUtilities.invokeLater(() -> chatTheme.appendSystemMessage(chatArea, content));
+        SwingUtilities.invokeLater(() -> chatList.addSystem(content, false));
     }
 
     @Override
     public void onRole(String role) {
         this.role = role;
-        SwingUtilities.invokeLater(() -> clearPublicButton.setVisible("admin".equals(role)));
+        // setListener 会补发缓存的角色，回调可能先于 UI 构造完成到达（本类构造器还没返回）
+        SwingUtilities.invokeLater(() -> {
+            if (clearPublicButton != null) {
+                clearPublicButton.setVisible("admin".equals(role));
+            }
+        });
     }
 
     @Override
@@ -589,28 +699,27 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     }
 
     @Override
-    public void onChatMessage(String sender, long timestamp, String content) {
+    public void onChatMessage(String sender, String msgId, long timestamp, String content) {
         SwingUtilities.invokeLater(() -> {
             if (!historyLoaded) {
-                pendingPublic.add(new Object[]{sender, timestamp, content});
+                pendingPublic.add(new Object[]{sender, msgId, timestamp, content});
                 return;
             }
-            chatTheme.appendMessage(chatArea, sender, timestamp, content, sender.equals(nickname));
+            appendPublicMessage(sender, msgId, timestamp, content);
         });
     }
 
     @Override
     public void onPublicHistoryBegin() {
         SwingUtilities.invokeLater(() -> {
-            chatArea.setText("");
+            chatList.clear();
             historyLoaded = false;
         });
     }
 
     @Override
-    public void onPublicHistoryItem(String sender, long timestamp, String content) {
-        SwingUtilities.invokeLater(() ->
-                chatTheme.appendMessage(chatArea, sender, timestamp, content, sender.equals(nickname)));
+    public void onPublicHistoryItem(String sender, String msgId, long timestamp, String content) {
+        SwingUtilities.invokeLater(() -> appendPublicMessage(sender, msgId, timestamp, content));
     }
 
     @Override
@@ -621,20 +730,105 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     @Override
     public void onPublicCleared(String operator) {
         SwingUtilities.invokeLater(() -> {
-            chatArea.setText("");
-            chatTheme.appendSystemMessage(chatArea,
-                    "公共聊天记录已被管理员「" + operator + "」清空");
+            chatList.clear();
+            chatList.addSystem("公共聊天记录已被管理员「" + operator + "」清空", false);
         });
     }
 
     @Override
-    public void onPrivateMessage(String peer, String sender, long timestamp,
+    public void onRecalled(String msgId, String byWho) {
+        SwingUtilities.invokeLater(() -> {
+            boolean mine = byWho.equals(nickname);
+            if (!historyLoaded) {
+                // 撤回事件可能与历史回放交错：记下来，渲染历史/pending 时跳过该消息
+                recalledDuringLoad.add(msgId);
+                for (int i = pendingPublic.size() - 1; i >= 0; i--) {
+                    if (msgId.equals(pendingPublic.get(i)[1])) {
+                        pendingPublic.remove(i);
+                    }
+                }
+                return;
+            }
+            chatList.recallMessage(msgId, bubbleChatList.recallText(byWho, mine));
+        });
+    }
+
+    @Override
+    public void onRecallFail(String msgId, String reason) {
+        SwingUtilities.invokeLater(() ->
+                JOptionPane.showMessageDialog(this, reason, "撤回失败", JOptionPane.WARNING_MESSAGE));
+    }
+
+    @Override
+    public void onAttention(String from) {
+        SwingUtilities.invokeLater(() -> {
+            chatList.addSystem("🔔 " + from + " 在公共频道 @ 了你", false);
+            flashAttention();
+        });
+    }
+
+    @Override
+    public void onSearchResultBegin(String peer) {
+        // 弹窗在点击搜索时已经建好，这里无需动作
+    }
+
+    @Override
+    public void onSearchResultItem(String peer, String msgId, String sender,
+                                   long timestamp, String content) {
+        SwingUtilities.invokeLater(() -> {
+            if ("PUBLIC".equals(peer)) {
+                if (activeSearchDialog != null) {
+                    activeSearchDialog.addResult(sender, timestamp, content);
+                }
+            } else {
+                privateChatUI w = privateWindows.get(peer);
+                if (w != null) {
+                    w.onSearchResultItem(sender, timestamp, content);
+                }
+            }
+        });
+    }
+
+    @Override
+    public void onSearchResultEnd(String peer) {
+        SwingUtilities.invokeLater(() -> {
+            if ("PUBLIC".equals(peer)) {
+                if (activeSearchDialog != null) {
+                    activeSearchDialog.finish();
+                }
+            } else {
+                privateChatUI w = privateWindows.get(peer);
+                if (w != null) {
+                    w.onSearchResultEnd();
+                }
+            }
+        });
+    }
+
+    @Override
+    public void onSearchFail(String peer, String reason) {
+        SwingUtilities.invokeLater(() -> {
+            if ("PUBLIC".equals(peer)) {
+                if (activeSearchDialog != null) {
+                    activeSearchDialog.fail(reason);
+                }
+            } else {
+                privateChatUI w = privateWindows.get(peer);
+                if (w != null) {
+                    w.onSearchFail(reason);
+                }
+            }
+        });
+    }
+
+    @Override
+    public void onPrivateMessage(String peer, String sender, String msgId, long timestamp,
                                  int unread, String content) {
         SwingUtilities.invokeLater(() -> {
             privateChatUI window = privateWindows.get(peer);
             boolean windowOpen = window != null && window.isDisplayable();
             if (windowOpen) {
-                window.appendMessage(sender, timestamp, content);
+                window.appendMessage(sender, msgId, timestamp, content);
                 if (!sender.equals(nickname)) {
                     // 窗口开着就当即读掉，服务端那份未读标记也要同步清掉
                     client.markPrivateRead(peer);
@@ -662,11 +856,12 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     }
 
     @Override
-    public void onPrivateHistoryItem(String peer, String sender, long timestamp, String content) {
+    public void onPrivateHistoryItem(String peer, String sender, String msgId,
+                                     long timestamp, String content) {
         SwingUtilities.invokeLater(() -> {
             privateChatUI w = privateWindows.get(peer);
             if (w != null) {
-                w.onHistoryItem(sender, timestamp, content);
+                w.onHistoryItem(sender, msgId, timestamp, content);
             }
         });
     }
@@ -705,6 +900,17 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     }
 
     @Override
+    public void onPrivateRecalled(String peer, String msgId, String byWho) {
+        SwingUtilities.invokeLater(() -> {
+            privateChatUI w = privateWindows.get(peer);
+            if (w != null) {
+                w.onRecalled(msgId, byWho);
+            }
+            // 窗口没开：对方撤了未读消息，红点按服务端随后补发的 UNREAD 汇总纠正
+        });
+    }
+
+    @Override
     public void onUnreadSummary(Map<String, Integer> counts) {
         SwingUtilities.invokeLater(() -> {
             // 取较大值而不是直接覆盖：这份汇总是服务端查询那一刻的快照，
@@ -716,15 +922,20 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
                 }
                 unreadCounts.merge(e.getKey(), e.getValue(), Math::max);
             }
-            userList.repaint();
+            if (userList != null) {
+                userList.repaint();
+            }
         });
     }
 
     @Override
     public void onUserList(String[] users) {
         SwingUtilities.invokeLater(() -> {
+            if (userList == null) {
+                return; // 缓存列表补发可能先于 UI 构造完成到达
+            }
             onlineUsers.clear();
-            java.util.Collections.addAll(onlineUsers, users);
+            Collections.addAll(onlineUsers, users);
             refreshUserList();
         });
     }
@@ -732,8 +943,11 @@ public class clientChatUI extends JFrame implements chatClient.Listener {
     @Override
     public void onOfflineUsers(String[] users) {
         SwingUtilities.invokeLater(() -> {
+            if (userList == null) {
+                return; // 同上
+            }
             offlineUsers.clear();
-            java.util.Collections.addAll(offlineUsers, users);
+            Collections.addAll(offlineUsers, users);
             refreshUserList();
         });
     }

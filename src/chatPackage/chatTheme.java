@@ -2,10 +2,10 @@ package chatPackage;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
-import javax.swing.text.BadLocationException;
-import javax.swing.text.Style;
-import javax.swing.text.StyleConstants;
-import javax.swing.text.StyledDocument;
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.Clip;
+import javax.sound.sampled.LineUnavailableException;
 import java.awt.*;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
@@ -15,7 +15,6 @@ import java.util.Date;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 聊天界面共享的配色、字体和消息渲染工具。
@@ -126,85 +125,12 @@ public final class chatTheme {
         });
     }
 
-    // ===== 消息渲染 =====
+    // ===== 时间格式 =====
 
     private static final SimpleDateFormat TIME_FORMAT = new SimpleDateFormat("HH:mm:ss");
 
-    /** 样式名序号：每次插入都用全新的样式名，避免同名 addStyle 复用导致既有消息被改色 */
-    private static final AtomicInteger STYLE_SEQ = new AtomicInteger();
-
     public static String formatTime(long timestamp) {
         return TIME_FORMAT.format(new Date(timestamp));
-    }
-
-    /**
-     * 往聊天面板追加一条消息。
-     *
-     * @param timestamp 服务端下发的 epoch millis，不要用客户端本地时间——否则同一条消息
-     *                  在实时收到和重登看历史时会显示成两个不同的时间
-     * @param isMine    是否是自己发的（用主题蓝显示；聊天区是白底，不能用白字）
-     */
-    public static void appendMessage(JTextPane pane, String sender, long timestamp,
-                                     String content, boolean isMine) {
-        StyledDocument doc = pane.getStyledDocument();
-
-        Style timeStyle = pane.addStyle("Time" + STYLE_SEQ.incrementAndGet(), null);
-        StyleConstants.setForeground(timeStyle, SYSTEM_MSG_COLOR);
-        StyleConstants.setFontSize(timeStyle, 11);
-        StyleConstants.setFontFamily(timeStyle, "Dialog");
-
-        Style senderStyle = pane.addStyle("Sender" + STYLE_SEQ.incrementAndGet(), null);
-        StyleConstants.setForeground(senderStyle, getColorForUser(sender));
-        StyleConstants.setBold(senderStyle, true);
-        StyleConstants.setFontSize(senderStyle, 13);
-        StyleConstants.setFontFamily(senderStyle, "Microsoft YaHei");
-
-        Style msgStyle = pane.addStyle("Msg" + STYLE_SEQ.incrementAndGet(), null);
-        StyleConstants.setForeground(msgStyle, isMine ? PRIMARY : TEXT_DARK);
-        StyleConstants.setFontSize(msgStyle, 14);
-        StyleConstants.setBold(msgStyle, false);
-        // 正文用中文字体：emoji 专用字体没有中文字形，中文会变成方块
-        StyleConstants.setFontFamily(msgStyle, isFontAvailable("Microsoft YaHei")
-                ? "Microsoft YaHei" : "Dialog");
-
-        try {
-            if (isMine) {
-                doc.insertString(doc.getLength(), "  ", msgStyle);
-            }
-            doc.insertString(doc.getLength(), "[" + formatTime(timestamp) + "] ", timeStyle);
-            doc.insertString(doc.getLength(), sender + ": ", senderStyle);
-            doc.insertString(doc.getLength(), content + "\n", msgStyle);
-            pane.setCaretPosition(doc.getLength());
-        } catch (BadLocationException e) {
-            e.printStackTrace();
-        }
-    }
-
-    /** 往聊天面板追加一条系统提示 */
-    public static void appendSystemMessage(JTextPane pane, String message) {
-        StyledDocument doc = pane.getStyledDocument();
-        Style style = pane.addStyle("System" + STYLE_SEQ.incrementAndGet(), null);
-        StyleConstants.setForeground(style, SYSTEM_MSG_COLOR);
-        StyleConstants.setFontSize(style, 12);
-        StyleConstants.setItalic(style, true);
-        StyleConstants.setFontFamily(style, "Microsoft YaHei");
-
-        try {
-            doc.insertString(doc.getLength(), "ℹ️ " + message + "\n", style);
-            pane.setCaretPosition(doc.getLength());
-        } catch (BadLocationException e) {
-            e.printStackTrace();
-        }
-    }
-
-    /** 创建一个只读的聊天消息面板 */
-    public static JTextPane createChatPane() {
-        JTextPane pane = new JTextPane();
-        pane.setEditable(false);
-        pane.setBackground(CARD_BG);
-        pane.setFont(getChatFont(14));
-        pane.setBorder(new EmptyBorder(10, 15, 10, 15));
-        return pane;
     }
 
     /** 把聊天面板套进无边框、滚动步进合适的滚动容器 */
@@ -323,5 +249,68 @@ public final class chatTheme {
         label.setText(username.isEmpty() ? "?" : username.substring(0, 1).toUpperCase());
         label.setToolTipText(username);
         return label;
+    }
+
+    // ===== 提示音 =====
+
+    /**
+     * 播放提示音（被 @ 提醒用）。
+     *
+     * WAV 在首次调用时程序化合成并缓存，不依赖任何外部资源文件。合成的是短促双音
+     * 「滴——滴」，440Hz/880Hz 正弦波带线性衰减包络，音量压到 0.35 避免刺耳。
+     * 整个播放路径 try/catch：无声卡/音频线不可用的环境下静默降级。
+     */
+    private static volatile Clip beepClip;
+
+    public static void playBeep() {
+        try {
+            Clip clip = beepClip;
+            if (clip == null) {
+                synchronized (chatTheme.class) {
+                    if (beepClip == null) {
+                        beepClip = buildBeepClip();
+                    }
+                    clip = beepClip;
+                }
+            }
+            if (clip != null) {
+                clip.stop();
+                clip.setFramePosition(0);
+                clip.start();
+            }
+        } catch (Exception ignored) {
+            // 音频不可用时静默降级，不影响主流程
+        }
+    }
+
+    private static Clip buildBeepClip() throws LineUnavailableException {
+        float sampleRate = 16000f;
+        int toneMs = 120, gapMs = 60, silenceMs = 100;
+        int total = (toneMs * 2 + gapMs + silenceMs) * 16; // 16 字节/毫秒（16kHz, 16bit 单声道）
+        byte[] data = new byte[total];
+        double[] freqs = {880.0, 880.0};
+
+        int pos = 0;
+        for (int i = 0; i < 2; i++) {
+            for (int t = 0; t < toneMs * 16; t += 2, pos += 2) {
+                double env = 1.0 - (t / 2) / (double) (toneMs * 16 / 2);
+                short sample = (short) (Math.sin(2 * Math.PI * freqs[i] * (t / 2) / sampleRate)
+                        * env * Short.MAX_VALUE * 0.35);
+                data[pos] = (byte) (sample & 0xFF);
+                data[pos + 1] = (byte) ((sample >> 8) & 0xFF);
+            }
+            pos += (i == 0 ? gapMs : silenceMs) * 16;
+        }
+
+        AudioFormat format = new AudioFormat(sampleRate, 16, 1, true, false);
+        try (java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(data);
+             javax.sound.sampled.AudioInputStream ais =
+                     new javax.sound.sampled.AudioInputStream(bais, format, data.length / 2)) {
+            Clip clip = AudioSystem.getClip();
+            clip.open(ais);
+            return clip;
+        } catch (Exception e) {
+            return null;
+        }
     }
 }

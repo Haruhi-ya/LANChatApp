@@ -33,7 +33,7 @@ public class chatClient {
         void onLoginResult(boolean success, String reason);   // LOGINOK / LOGINFAIL:原因
         void onRegisterResult(boolean success, String reason); // REGISTEROK / REGISTERFAIL:原因
         void onSystemMessage(String content);          // SYSTEM:xxx 系统消息
-        void onChatMessage(String sender, long timestamp, String content); // MSG:昵称:时间戳:内容
+        void onChatMessage(String sender, String msgId, long timestamp, String content); // MSG:昵称:消息ID:时间戳:内容
         void onUserList(String[] users);               // USERS:... 在线用户列表
         void onOfflineUsers(String[] users);           // OFFLINEUSERS:... 离线用户列表
         void onDisconnected(String reason);            // 连接断开（异常/被服务器关闭/主动退出）
@@ -50,7 +50,7 @@ public class chatClient {
         // ===== 公共聊天历史回放 =====
 
         default void onPublicHistoryBegin() {}
-        default void onPublicHistoryItem(String sender, long timestamp, String content) {}
+        default void onPublicHistoryItem(String sender, String msgId, long timestamp, String content) {}
         default void onPublicHistoryEnd() {}
 
         /** 公共聊天记录已被管理员清空 */
@@ -63,13 +63,14 @@ public class chatClient {
          *
          * @param peer      会话对方（自己发出的消息里是接收者，收到的消息里是发送者）
          * @param sender    实际发送者
+         * @param msgId     服务端生成的撤回定位 ID（老消息可能为空字符串）
          * @param unread    服务端给出的权威未读数，客户端直接显示这个值，不要本地自增
          */
-        default void onPrivateMessage(String peer, String sender, long timestamp,
+        default void onPrivateMessage(String peer, String sender, String msgId, long timestamp,
                                       int unread, String content) {}
 
         default void onPrivateHistoryBegin(String peer) {}
-        default void onPrivateHistoryItem(String peer, String sender, long timestamp, String content) {}
+        default void onPrivateHistoryItem(String peer, String sender, String msgId, long timestamp, String content) {}
         default void onPrivateHistoryEnd(String peer) {}
 
         /** 自己与某人的私聊记录已清空 */
@@ -80,6 +81,28 @@ public class chatClient {
 
         /** 未读私聊汇总：对方用户名 -> 未读条数 */
         default void onUnreadSummary(Map<String, Integer> counts) {}
+
+        // ===== 消息撤回 =====
+
+        /** 公共消息已被撤回（msgId 定位气泡，byWho 是操作者） */
+        default void onRecalled(String msgId, String byWho) {}
+
+        /** 私聊消息已被撤回（peer 是会话对方） */
+        default void onPrivateRecalled(String peer, String msgId, String byWho) {}
+
+        /** 撤回被拒（超时/无权/不存在） */
+        default void onRecallFail(String msgId, String reason) {}
+
+        // ===== 搜索与@提醒 =====
+
+        /** 搜索结果回放：peer 为 "PUBLIC" 表示公共频道，否则是私聊会话对方 */
+        default void onSearchResultBegin(String peer) {}
+        default void onSearchResultItem(String peer, String msgId, String sender, long timestamp, String content) {}
+        default void onSearchResultEnd(String peer) {}
+        default void onSearchFail(String peer, String reason) {}
+
+        /** 公共消息里被 @ 了（from 是 @ 你的人） */
+        default void onAttention(String from) {}
     }
 
     /** 连接超时时间（毫秒），局域网连接不上时避免长时间卡住 */
@@ -192,6 +215,26 @@ public class chatClient {
     /** 拉取未读私聊汇总，结果通过 onUnreadSummary 回调 */
     public void requestUnread() {
         sendLine("UNREAD");
+    }
+
+    /** 撤回一条公共消息（只能撤自己的；管理员可撤任何人的） */
+    public void recall(String msgId) {
+        sendLine("RECALL:" + msgId);
+    }
+
+    /** 撤回一条私聊消息（只能撤自己的） */
+    public void recallPrivate(String peer, String msgId) {
+        sendLine("PMRECALL:" + peer + ":" + msgId);
+    }
+
+    /** 搜索公共聊天记录 */
+    public void searchPublic(String keyword) {
+        sendLine("SEARCHPUB:" + keyword);
+    }
+
+    /** 搜索与某人的私聊记录 */
+    public void searchPrivate(String peer, String keyword) {
+        sendLine("SEARCHPM:" + peer + ":" + keyword);
     }
 
     /** 主动退出：发送 LOGOUT 并关闭连接 */
@@ -317,37 +360,37 @@ public class chatClient {
         } else if (line.startsWith("SYSTEM:")) {
             listener.onSystemMessage(line.substring("SYSTEM:".length()));
         } else if (line.startsWith("MSG:")) {
-            // MSG:昵称:时间戳:内容
-            String[] p = splitFixed(line.substring("MSG:".length()), 2);
+            // MSG:昵称:消息ID:时间戳:内容
+            String[] p = splitFixed(line.substring("MSG:".length()), 3);
             if (p != null) {
-                listener.onChatMessage(p[0], parseLong(p[1], System.currentTimeMillis()), p[2]);
+                listener.onChatMessage(p[0], p[1], parseLong(p[2], System.currentTimeMillis()), p[3]);
             }
         } else if (line.equals("HISTBEGIN")) {
             listener.onPublicHistoryBegin();
         } else if (line.startsWith("HISTITEM:")) {
-            // HISTITEM:昵称:时间戳:内容
-            String[] p = splitFixed(line.substring("HISTITEM:".length()), 2);
+            // HISTITEM:昵称:消息ID:时间戳:内容（老消息 msgId 是空字段）
+            String[] p = splitFixed(line.substring("HISTITEM:".length()), 3);
             if (p != null) {
-                listener.onPublicHistoryItem(p[0], parseLong(p[1], 0L), p[2]);
+                listener.onPublicHistoryItem(p[0], p[1], parseLong(p[2], 0L), p[3]);
             }
         } else if (line.equals("HISTEND")) {
             listener.onPublicHistoryEnd();
         } else if (line.startsWith("PUBLICCLEARED:")) {
             listener.onPublicCleared(line.substring("PUBLICCLEARED:".length()));
         } else if (line.startsWith("PMMSG:")) {
-            // PMMSG:对方:发送者:时间戳:未读数:内容
-            String[] p = splitFixed(line.substring("PMMSG:".length()), 4);
+            // PMMSG:对方:发送者:消息ID:时间戳:未读数:内容
+            String[] p = splitFixed(line.substring("PMMSG:".length()), 5);
             if (p != null) {
-                listener.onPrivateMessage(p[0], p[1], parseLong(p[2], System.currentTimeMillis()),
-                        (int) parseLong(p[3], 0L), p[4]);
+                listener.onPrivateMessage(p[0], p[1], p[2], parseLong(p[3], System.currentTimeMillis()),
+                        (int) parseLong(p[4], 0L), p[5]);
             }
         } else if (line.startsWith("PMHISTBEGIN:")) {
             listener.onPrivateHistoryBegin(line.substring("PMHISTBEGIN:".length()));
         } else if (line.startsWith("PMHISTITEM:")) {
-            // PMHISTITEM:对方:发送者:时间戳:内容
-            String[] p = splitFixed(line.substring("PMHISTITEM:".length()), 3);
+            // PMHISTITEM:对方:发送者:消息ID:时间戳:内容（老消息 msgId 是空字段）
+            String[] p = splitFixed(line.substring("PMHISTITEM:".length()), 4);
             if (p != null) {
-                listener.onPrivateHistoryItem(p[0], p[1], parseLong(p[2], 0L), p[3]);
+                listener.onPrivateHistoryItem(p[0], p[1], p[2], parseLong(p[3], 0L), p[4]);
             }
         } else if (line.startsWith("PMHISTEND:")) {
             listener.onPrivateHistoryEnd(line.substring("PMHISTEND:".length()));
@@ -358,6 +401,42 @@ public class chatClient {
             String[] p = splitFixed(line.substring("PMFAIL:".length()), 1);
             if (p != null) {
                 listener.onPrivateFail(p[0], p[1]);
+            }
+        } else if (line.startsWith("RECALLED:")) {
+            // RECALLED:消息ID:操作者
+            String[] p = splitFixed(line.substring("RECALLED:".length()), 1);
+            if (p != null) {
+                listener.onRecalled(p[0], p[1]);
+            }
+        } else if (line.startsWith("PMRECALLED:")) {
+            // PMRECALLED:对方:消息ID:操作者
+            String[] p = splitFixed(line.substring("PMRECALLED:".length()), 2);
+            if (p != null) {
+                listener.onPrivateRecalled(p[0], p[1], p[2]);
+            }
+        } else if (line.startsWith("RECALLFAIL:")) {
+            // RECALLFAIL:消息ID:原因
+            String[] p = splitFixed(line.substring("RECALLFAIL:".length()), 1);
+            if (p != null) {
+                listener.onRecallFail(p[0], p[1]);
+            }
+        } else if (line.startsWith("ATMSG:")) {
+            listener.onAttention(line.substring("ATMSG:".length()));
+        } else if (line.startsWith("SRESULTBEGIN:")) {
+            listener.onSearchResultBegin(line.substring("SRESULTBEGIN:".length()));
+        } else if (line.startsWith("SRESULT:")) {
+            // SRESULT:对方:消息ID:发送者:时间戳:内容
+            String[] p = splitFixed(line.substring("SRESULT:".length()), 4);
+            if (p != null) {
+                listener.onSearchResultItem(p[0], p[1], p[2], parseLong(p[3], 0L), p[4]);
+            }
+        } else if (line.startsWith("SRESULTEND:")) {
+            listener.onSearchResultEnd(line.substring("SRESULTEND:".length()));
+        } else if (line.startsWith("SEARCHFAIL:")) {
+            // SEARCHFAIL:对方:原因
+            String[] p = splitFixed(line.substring("SEARCHFAIL:".length()), 1);
+            if (p != null) {
+                listener.onSearchFail(p[0], p[1]);
             }
         } else if (line.startsWith("UNREAD:")) {
             listener.onUnreadSummary(parseUnread(line.substring("UNREAD:".length())));
