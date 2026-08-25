@@ -70,6 +70,15 @@ public class dbManager {
             }
         }
 
+        // 兼容旧表：无 avatar 列则补列（自定义头像功能），NULL = 未设置头像
+        try (var rs = conn.getMetaData().getColumns(conn.getCatalog(), null, "Users", "avatar")) {
+            if (!rs.next()) {
+                try (Statement st = conn.createStatement()) {
+                    st.executeUpdate("ALTER TABLE Users ADD COLUMN avatar MEDIUMBLOB NULL");
+                }
+            }
+        }
+
         // 初始化管理员账号（INSERT IGNORE：已存在则不覆盖，密码不会被重置）
         try (PreparedStatement ps = conn.prepareStatement(
                 "INSERT IGNORE INTO Users(username, password, role) VALUES (?, ?, 'admin')")) {
@@ -102,6 +111,22 @@ public class dbManager {
                 try (Statement st = conn.createStatement()) {
                     st.executeUpdate("ALTER TABLE PrivateMessages ADD COLUMN client_id VARCHAR(36) NULL");
                     st.executeUpdate("ALTER TABLE PrivateMessages ADD INDEX idx_cid (client_id)");
+                }
+            }
+        }
+
+        // 图片消息：content 列从 TEXT（64KB）扩到 MEDIUMTEXT（16MB）。
+        // 只检测是否为 TEXT（旧表），已是 MEDIUMTEXT 则跳过。
+        migrateContentToMediumText("PublicMessages");
+        migrateContentToMediumText("PrivateMessages");
+    }
+
+    /** 消息表 content 列检测-升级：TEXT 旧列 MODIFY 成 MEDIUMTEXT（容纳 [IMG]Base64 图片消息） */
+    private void migrateContentToMediumText(String table) throws SQLException {
+        try (var rs = conn.getMetaData().getColumns(conn.getCatalog(), null, table, "content")) {
+            if (rs.next() && "TEXT".equalsIgnoreCase(rs.getString("TYPE_NAME"))) {
+                try (Statement st = conn.createStatement()) {
+                    st.executeUpdate("ALTER TABLE " + table + " MODIFY content MEDIUMTEXT NOT NULL");
                 }
             }
         }
@@ -139,6 +164,30 @@ public class dbManager {
                     + "INDEX idx_conv (`owner`, peer, id), "
                     + "INDEX idx_unread (`owner`, is_read)) "
                     + "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        }
+    }
+
+    /** 查询用户头像字节，未设置返回 null（与「设置过、图片恰为空」不冲突，存入时已拒绝空数据） */
+    public synchronized byte[] getAvatar(String username) throws SQLException {
+        String sql = "SELECT avatar FROM Users WHERE username = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, username);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getBytes("avatar");
+                }
+            }
+        }
+        return null;
+    }
+
+    /** 保存/清除用户头像（data 为 null 或空 = 清除）。返回用户是否存在 */
+    public synchronized boolean setAvatar(String username, byte[] data) throws SQLException {
+        String sql = "UPDATE Users SET avatar = ? WHERE username = ?";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setBytes(1, data == null || data.length == 0 ? null : data);
+            ps.setString(2, username);
+            return ps.executeUpdate() > 0;
         }
     }
 

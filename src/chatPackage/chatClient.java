@@ -8,6 +8,7 @@ import java.io.PrintWriter;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -103,6 +104,17 @@ public class chatClient {
 
         /** 公共消息里被 @ 了（from 是 @ 你的人） */
         default void onAttention(String from) {}
+
+        // ===== 头像 =====
+
+        /** GETAVATAR 响应：data 为图片字节；data == null 表示该用户未设置头像 */
+        default void onAvatar(String name, byte[] data) {}
+
+        /** 某人头像已变更（AVATARCHG）：清缓存，下次绘制时按需重拉 */
+        default void onAvatarChanged(String name) {}
+
+        /** SETAVATAR 结果：上传成功 / 失败原因 */
+        default void onAvatarResult(boolean success, String reason) {}
     }
 
     /** 连接超时时间（毫秒），局域网连接不上时避免长时间卡住 */
@@ -235,6 +247,16 @@ public class chatClient {
     /** 搜索与某人的私聊记录 */
     public void searchPrivate(String peer, String keyword) {
         sendLine("SEARCHPM:" + peer + ":" + keyword);
+    }
+
+    /** 拉取某用户的头像，结果通过 onAvatar 回调 */
+    public void getAvatar(String username) {
+        sendLine("GETAVATAR:" + username);
+    }
+
+    /** 上传自己的头像（base64 为空字符串 = 移除头像），结果通过 onAvatarResult 回调 */
+    public void setAvatar(String base64) {
+        sendLine("SETAVATAR:" + base64);
     }
 
     /** 主动退出：发送 LOGOUT 并关闭连接 */
@@ -454,6 +476,26 @@ public class chatClient {
             listener.onKicked(line.substring("KICKED:".length()));
         } else if (line.startsWith("BANNED:")) {
             listener.onBanned(line.substring("BANNED:".length()));
+        } else if (line.startsWith("AVATAR:")) {
+            // AVATAR:用户名:base64（未设置头像时 base64 为空字段）
+            String[] p = splitFixed(line.substring("AVATAR:".length()), 1);
+            if (p != null) {
+                byte[] data = null;
+                if (!p[1].isEmpty()) {
+                    try {
+                        data = Base64.getDecoder().decode(p[1]);
+                    } catch (IllegalArgumentException e) {
+                        data = null; // 损坏数据按无头像处理，渲染端回退首字母
+                    }
+                }
+                listener.onAvatar(p[0], data);
+            }
+        } else if (line.startsWith("AVATARCHG:")) {
+            listener.onAvatarChanged(line.substring("AVATARCHG:".length()));
+        } else if (line.equals("AVATAROK")) {
+            listener.onAvatarResult(true, "");
+        } else if (line.startsWith("AVATARFAIL:")) {
+            listener.onAvatarResult(false, line.substring("AVATARFAIL:".length()));
         }
     }
 

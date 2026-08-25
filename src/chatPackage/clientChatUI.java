@@ -1,10 +1,17 @@
 package chatPackage;
 
+import javax.imageio.ImageIO;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
+import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.*;
 import java.awt.event.*;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -36,6 +43,7 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
     private JTextField searchField;
     private JLabel connectionStatusLabel;
     private JLabel userCountLabel;
+    private chatTheme.AvatarLabel selfAvatarLabel;
 
     // 用户信息
     private final String nickname;
@@ -69,7 +77,7 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
      * 跨行顺序没有保证，不缓冲就会出现重复或乱序。
      */
     private boolean historyLoaded;
-    private final List<Object[]> pendingPublic = new ArrayList<>(); // {sender, msgId, ts, content}
+    private final List<Object[]> pendingPublic = new ArrayList<>(); // {sender, msgId, ts, content, img}
     private final Set<String> recalledDuringLoad = ConcurrentHashMap.newKeySet();
     private Timer historyTimeout;
 
@@ -96,6 +104,9 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
         // 注册消息回调（回调发生在接收线程，实现里统一用 invokeLater 切回 EDT 更新界面）
         // 注意：登录验证已在登录界面完成，这里只接管消息渲染，不能再调用 login()
         client.setListener(this);
+        // 头像按需拉取的唯一来源：气泡/列表绘制发现未缓存时通过它发 GETAVATAR。
+        // 本进程只有一个聊天窗口，这里单次注册；私聊窗口复用，不重复注册。
+        chatTheme.setAvatarProvider(name -> client.getAvatar(name));
         initUI();
         beginHistoryLoad();
     }
@@ -179,9 +190,19 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
         serverInfoLabel.setForeground(chatTheme.TEXT_GRAY);
         rightPanel.add(serverInfoLabel);
 
-        JLabel avatarLabel = chatTheme.createAvatarLabel(nickname, 30, 14);
-        avatarLabel.setBorder(BorderFactory.createLineBorder(Color.WHITE, 2));
-        rightPanel.add(avatarLabel);
+        selfAvatarLabel = chatTheme.createAvatarLabel(nickname, 30, 14);
+        selfAvatarLabel.setBorder(BorderFactory.createLineBorder(Color.WHITE, 2));
+        selfAvatarLabel.setToolTipText("点击更换头像");
+        selfAvatarLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        selfAvatarLabel.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (SwingUtilities.isLeftMouseButton(e)) {
+                    showAvatarMenu();
+                }
+            }
+        });
+        rightPanel.add(selfAvatarLabel);
 
         JLabel nicknameLabel = new JLabel(nickname);
         nicknameLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 13));
@@ -300,6 +321,9 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
         emojiButton = chatTheme.createIconButton("😊", "表情");
         emojiButton.addActionListener(e -> emojiPopup.show(emojiButton, 0, emojiButton.getHeight()));
         buttonGroup.add(emojiButton);
+        JButton imageButton = chatTheme.createIconButton("📷", "发送图片");
+        imageButton.addActionListener(e -> chooseAndSendImage());
+        buttonGroup.add(imageButton);
         inputPanel.add(buttonGroup, BorderLayout.WEST);
 
         inputField = chatTheme.createInputField();
@@ -322,6 +346,57 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
             client.sendMessage(message);
             inputField.setText("");
             inputField.requestFocusInWindow();
+        }
+    }
+
+    // ===== 头像与图片发送 =====
+
+    private void showAvatarMenu() {
+        JPopupMenu menu = new JPopupMenu();
+        JMenuItem changeItem = new JMenuItem("更换头像");
+        changeItem.addActionListener(e -> chooseAndSetAvatar());
+        menu.add(changeItem);
+        JMenuItem removeItem = new JMenuItem("移除头像");
+        removeItem.addActionListener(e -> client.setAvatar(""));
+        menu.add(removeItem);
+        menu.show(selfAvatarLabel, 0, selfAvatarLabel.getHeight());
+    }
+
+    private void chooseAndSetAvatar() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("选择头像图片（JPG / PNG，128px 内）");
+        chooser.setFileFilter(new FileNameExtensionFilter("图片文件 (jpg, png)", "jpg", "jpeg", "png"));
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+        File file = chooser.getSelectedFile();
+        if (file.length() > chatTheme.MAX_AVATAR_BYTES) {
+            JOptionPane.showMessageDialog(this, "头像文件过大（上限 128KB），请换一张更小的图片",
+                    "更换头像", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        try {
+            byte[] bytes = chatTheme.buildAvatarBytes(file);
+            client.setAvatar(Base64.getEncoder().encodeToString(bytes));
+        } catch (IOException ex) {
+            JOptionPane.showMessageDialog(this, "读取图片失败：" + ex.getMessage(),
+                    "更换头像", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private void chooseAndSendImage() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("选择要发送的图片（JPG / PNG，≤1MB）");
+        chooser.setFileFilter(new FileNameExtensionFilter("图片文件 (jpg, png)", "jpg", "jpeg", "png"));
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+        try {
+            // 图片消息与文本走同一条协议管道（[IMG]Base64），由服务端广播回来统一渲染
+            client.sendMessage(chatTheme.buildImageMessage(chooser.getSelectedFile()));
+        } catch (IOException ex) {
+            JOptionPane.showMessageDialog(this, "发送失败：" + ex.getMessage(),
+                    "发送图片", JOptionPane.WARNING_MESSAGE);
         }
     }
 
@@ -348,7 +423,7 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
             historyTimeout.stop();
         }
         for (Object[] m : pendingPublic) {
-            appendPublicMessage((String) m[0], (String) m[1], (Long) m[2], (String) m[3]);
+            appendPublicMessage((String) m[0], (String) m[1], (Long) m[2], (String) m[3], (Image) m[4]);
         }
         pendingPublic.clear();
         recalledDuringLoad.clear();
@@ -368,21 +443,27 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
 
     // ===== 气泡：构造与撤回 =====
 
-    /** 构造一个公共消息气泡（带 @ 高亮判断） */
+    /** 构造一个公共消息气泡：图片消息带解码图，文本消息带 @ 高亮判断 */
     private bubbleChatList.BubbleMsg makePublicBubble(String sender, String msgId,
-                                                      long timestamp, String content) {
+                                                      long timestamp, String content, Image img) {
         boolean mine = sender.equals(nickname);
         boolean canRecall = !msgId.isEmpty() && (mine || "admin".equals(role));
+        if (chatTheme.isImageContent(content)) {
+            // 图片消息不参与 @ 高亮；解码失败用占位图，避免 Base64 当文本渲染
+            return bubbleChatList.bubbleImage(sender, msgId, timestamp, content,
+                    mine, canRecall, img != null ? img : chatTheme.placeholderImage());
+        }
         String mention = mentionPattern.matcher(content).find() ? nickname : null;
         return bubbleChatList.bubble(sender, msgId, timestamp, content, mine, canRecall, mention);
     }
 
-    private void appendPublicMessage(String sender, String msgId, long timestamp, String content) {
+    private void appendPublicMessage(String sender, String msgId, long timestamp,
+                                     String content, Image img) {
         // 历史加载期间被撤回的消息不渲染（撤回事件可能早于/穿插在历史条目中间到达）
         if (recalledDuringLoad.contains(msgId)) {
             return;
         }
-        chatList.addMessage(makePublicBubble(sender, msgId, timestamp, content));
+        chatList.addMessage(makePublicBubble(sender, msgId, timestamp, content, img));
     }
 
     @Override
@@ -543,7 +624,7 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
 
     /** 用户列表渲染器：头像 + 名字 + 未读徽标 + 在线状态点 */
     private class UserListCellRenderer extends JPanel implements ListCellRenderer<UserEntry> {
-        private final JLabel avatarLabel;
+        private final chatTheme.AvatarLabel avatarLabel;
         private final JLabel nameLabel;
         private final JLabel statusLabel;
         private final UnreadBadge badge;
@@ -553,12 +634,7 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
             setBorder(new EmptyBorder(5, 10, 5, 10));
             setOpaque(true);
 
-            avatarLabel = new JLabel();
-            avatarLabel.setPreferredSize(new Dimension(28, 28));
-            avatarLabel.setHorizontalAlignment(SwingConstants.CENTER);
-            avatarLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 12));
-            avatarLabel.setForeground(Color.WHITE);
-            avatarLabel.setOpaque(true);
+            avatarLabel = chatTheme.createAvatarLabel("", 28, 12);
 
             nameLabel = new JLabel();
             nameLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
@@ -588,8 +664,7 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
         public Component getListCellRendererComponent(JList<? extends UserEntry> list, UserEntry value,
                                                       int index, boolean isSelected, boolean cellHasFocus) {
             if (value != null) {
-                avatarLabel.setText(value.name.substring(0, 1).toUpperCase());
-                avatarLabel.setBackground(chatTheme.getColorForUser(value.name));
+                avatarLabel.setUsername(value.name);
                 nameLabel.setText(value.name);
                 statusLabel.setForeground(value.online ? chatTheme.ONLINE_GREEN : chatTheme.OFFLINE_GRAY);
                 nameLabel.setForeground(value.online ? chatTheme.TEXT_DARK : chatTheme.OFFLINE_TEXT);
@@ -700,12 +775,14 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
 
     @Override
     public void onChatMessage(String sender, String msgId, long timestamp, String content) {
+        // 图片解码放在接收线程（invokeLater 之前），大图解码不卡 EDT
+        Image img = chatTheme.decodeImageMessage(content);
         SwingUtilities.invokeLater(() -> {
             if (!historyLoaded) {
-                pendingPublic.add(new Object[]{sender, msgId, timestamp, content});
+                pendingPublic.add(new Object[]{sender, msgId, timestamp, content, img});
                 return;
             }
-            appendPublicMessage(sender, msgId, timestamp, content);
+            appendPublicMessage(sender, msgId, timestamp, content, img);
         });
     }
 
@@ -719,7 +796,8 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
 
     @Override
     public void onPublicHistoryItem(String sender, String msgId, long timestamp, String content) {
-        SwingUtilities.invokeLater(() -> appendPublicMessage(sender, msgId, timestamp, content));
+        Image img = chatTheme.decodeImageMessage(content);
+        SwingUtilities.invokeLater(() -> appendPublicMessage(sender, msgId, timestamp, content, img));
     }
 
     @Override
@@ -962,5 +1040,59 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
             connectionStatusLabel.setForeground(chatTheme.DANGER);
             shutdownAfter("连接断开", "与服务器的连接已断开：" + reason);
         });
+    }
+
+    // ===== 头像回调 =====
+
+    @Override
+    public void onAvatar(String name, byte[] data) {
+        // ImageIO.read 在接收线程做，大图解码不卡 EDT
+        BufferedImage bmp = null;
+        if (data != null) {
+            try {
+                bmp = ImageIO.read(new ByteArrayInputStream(data));
+            } catch (IOException e) {
+                bmp = null; // 损坏数据按无头像处理（chatTheme 落负缓存，不再重拉）
+            }
+        }
+        final BufferedImage img = bmp;
+        SwingUtilities.invokeLater(() -> {
+            if (chatTheme.cacheAvatar(name, img)) {
+                refreshAllAvatars();
+            }
+        });
+    }
+
+    @Override
+    public void onAvatarChanged(String name) {
+        SwingUtilities.invokeLater(() -> {
+            chatTheme.onAvatarChanged(name);
+            refreshAllAvatars(); // 重绘触发未缓存头像按需重拉
+        });
+    }
+
+    @Override
+    public void onAvatarResult(boolean success, String reason) {
+        SwingUtilities.invokeLater(() -> {
+            if (success) {
+                JOptionPane.showMessageDialog(this, "头像已更新", "更换头像",
+                        JOptionPane.INFORMATION_MESSAGE);
+            } else {
+                JOptionPane.showMessageDialog(this, "更换头像失败：" + reason, "更换头像",
+                        JOptionPane.WARNING_MESSAGE);
+            }
+        });
+    }
+
+    /** 头像缓存变化后统一重绘所有显示头像的地方（气泡列表 / 用户列表 / 顶栏 / 私聊窗口） */
+    private void refreshAllAvatars() {
+        chatList.repaintTable();
+        userList.repaint();
+        if (selfAvatarLabel != null) {
+            selfAvatarLabel.repaint();
+        }
+        for (privateChatUI w : privateWindows.values()) {
+            w.refreshAvatars();
+        }
     }
 }

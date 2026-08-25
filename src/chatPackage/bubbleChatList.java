@@ -1,5 +1,6 @@
 package chatPackage;
 
+import javax.imageio.ImageIO;
 import javax.swing.*;
 import javax.swing.table.AbstractTableModel;
 import java.awt.*;
@@ -13,6 +14,9 @@ import java.awt.font.LineBreakMeasurer;
 import java.awt.font.TextAttribute;
 import java.awt.font.TextLayout;
 import java.awt.geom.RoundRectangle2D;
+import java.awt.image.BufferedImage;
+import java.io.File;
+import java.io.IOException;
 import java.text.AttributedString;
 import java.text.BreakIterator;
 import java.util.ArrayList;
@@ -41,6 +45,9 @@ public class bubbleChatList extends JPanel {
     /** 气泡最大宽度 = 列宽的该比例（短消息气泡不能横贯整列） */
     private static final float BUBBLE_MAX_WIDTH_RATIO = 0.62f;
 
+    /** 图片消息的最大显示高度（像素），超高图片等比缩窄 */
+    private static final int IMAGE_MAX_HEIGHT = 400;
+
     private static final Color BUBBLE_OTHER_BG = new Color(244, 246, 251);
     private static final Color BUBBLE_MINE_BG = chatTheme.PRIMARY;
     private static final Color BUBBLE_OTHER_TEXT = chatTheme.TEXT_DARK;
@@ -63,9 +70,15 @@ public class bubbleChatList extends JPanel {
         public final boolean mine;
         public final boolean canRecall;
         public final String mentionName; // 内容里 @ 到的自己，用于高亮；null = 无
+        public final Image image;        // 图片消息的解码图；null = 文本消息
 
         BubbleMsg(String sender, String msgId, long timestamp, String content,
                   boolean mine, boolean canRecall, String mentionName) {
+            this(sender, msgId, timestamp, content, mine, canRecall, mentionName, null);
+        }
+
+        BubbleMsg(String sender, String msgId, long timestamp, String content,
+                  boolean mine, boolean canRecall, String mentionName, Image image) {
             this.sender = sender;
             this.msgId = msgId;
             this.timestamp = timestamp;
@@ -73,6 +86,7 @@ public class bubbleChatList extends JPanel {
             this.mine = mine;
             this.canRecall = canRecall;
             this.mentionName = mentionName;
+            this.image = image;
         }
     }
 
@@ -85,16 +99,27 @@ public class bubbleChatList extends JPanel {
         }
     }
 
-    /** 某宽度下排好版的文本行（缓存在 item 里） */
+    /** 某宽度下排好版的文本行 / 图片尺寸（缓存在 item 里） */
     private static class Layout {
         final int width;
         final List<TextLayout> lines = new ArrayList<>();
-        final int totalTextHeight;
+        final int totalTextHeight; // 文本：行总高；图片：图片显示高度
+        final int imageW;          // 图片显示宽度（文本消息为 0）
+        final int imageH;          // 图片显示高度（文本消息为 0）
 
         Layout(int width, List<TextLayout> lines, int totalTextHeight) {
             this.width = width;
             this.lines.addAll(lines);
             this.totalTextHeight = totalTextHeight;
+            this.imageW = 0;
+            this.imageH = 0;
+        }
+
+        Layout(int width, int imageW, int imageH) {
+            this.width = width;
+            this.totalTextHeight = imageH;
+            this.imageW = imageW;
+            this.imageH = imageH;
         }
     }
 
@@ -214,12 +239,42 @@ public class bubbleChatList extends JPanel {
             recallItem.addActionListener(ev -> menuHandler.onRecall(item.msg));
             menu.add(recallItem);
         }
-        JMenuItem copyItem = new JMenuItem("复制这条消息");
-        copyItem.addActionListener(ev ->
-                Toolkit.getDefaultToolkit().getSystemClipboard()
-                        .setContents(new StringSelection(item.msg.content), null));
-        menu.add(copyItem);
+        if (item.msg.image != null) {
+            JMenuItem saveItem = new JMenuItem("保存图片");
+            saveItem.addActionListener(ev -> saveImage(item.msg));
+            menu.add(saveItem);
+        } else {
+            JMenuItem copyItem = new JMenuItem("复制这条消息");
+            copyItem.addActionListener(ev ->
+                    Toolkit.getDefaultToolkit().getSystemClipboard()
+                            .setContents(new StringSelection(item.msg.content), null));
+            menu.add(copyItem);
+        }
         menu.show(table, e.getX(), e.getY());
+    }
+
+    /** 图片消息另存为 PNG */
+    private void saveImage(BubbleMsg msg) {
+        if (!(msg.image instanceof BufferedImage)) {
+            JOptionPane.showMessageDialog(table, "图片数据不可用", "保存图片",
+                    JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        JFileChooser chooser = new JFileChooser();
+        chooser.setSelectedFile(new File(msg.sender + "_" + msg.timestamp + ".png"));
+        if (chooser.showSaveDialog(table) != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+        File file = chooser.getSelectedFile();
+        if (!file.getName().toLowerCase().endsWith(".png")) {
+            file = new File(file.getParentFile(), file.getName() + ".png");
+        }
+        try {
+            ImageIO.write((BufferedImage) msg.image, "png", file);
+        } catch (IOException e) {
+            JOptionPane.showMessageDialog(table, "保存失败：" + e.getMessage(), "保存图片",
+                    JOptionPane.ERROR_MESSAGE);
+        }
     }
 
     // ===== 对外操作（EDT） =====
@@ -270,6 +325,14 @@ public class bubbleChatList extends JPanel {
         model.items.clear();
         model.fireTableDataChanged();
         afterModelChange();
+    }
+
+    /**
+     * 强制整表重绘（头像按需加载完成后调用）。头像不影响行高，
+     * 只需要 repaint 不需要 revalidate。
+     */
+    public void repaintTable() {
+        table.repaint();
     }
 
     /** 气泡消息里是否已有该 msgId（撤回事件可能早于历史回放到达） */
@@ -362,6 +425,17 @@ public class bubbleChatList extends JPanel {
         return new Layout(width, lines, totalHeight);
     }
 
+    /** 图片显示尺寸：等比缩放，宽不超 availW、高不超 IMAGE_MAX_HEIGHT；坏图给占位尺寸 */
+    private static Layout layoutImage(Image image, int columnWidth, int availW) {
+        int iw = image.getWidth(null);
+        int ih = image.getHeight(null);
+        if (iw <= 0 || ih <= 0) {
+            return new Layout(columnWidth, Math.min(availW, 160), 120);
+        }
+        double scale = Math.min(1.0, Math.min(availW / (double) iw, IMAGE_MAX_HEIGHT / (double) ih));
+        return new Layout(columnWidth, Math.max(1, (int) (iw * scale)), Math.max(1, (int) (ih * scale)));
+    }
+
     private class BubbleRenderer extends JComponent implements javax.swing.table.TableCellRenderer {
         private RowItem item;
         private int columnWidth;
@@ -386,6 +460,11 @@ public class bubbleChatList extends JPanel {
         /** 目标换行宽度：气泡文本区或系统文本区（居中留白 40） */
         private Layout layoutFor(RowItem rowItem, int width) {
             if (rowItem.msg != null) {
+                if (rowItem.msg.image != null) {
+                    // 图片消息：按列宽约束显示尺寸（最大宽 = 气泡上限，最大高 400px）
+                    int bubbleMax = Math.max(40, (int) (width * BUBBLE_MAX_WIDTH_RATIO));
+                    return layoutImage(rowItem.msg.image, width, bubbleMax - 24);
+                }
                 int bubbleMax = Math.max(40, (int) (width * BUBBLE_MAX_WIDTH_RATIO));
                 int textWidth = bubbleMax - 24; // 气泡水平内边距 12*2
                 Color normal = rowItem.msg.mine ? BUBBLE_MINE_TEXT : BUBBLE_OTHER_TEXT;
@@ -453,12 +532,17 @@ public class bubbleChatList extends JPanel {
             int maxBubbleWidth = Math.max(40, (int) (columnWidth * BUBBLE_MAX_WIDTH_RATIO));
             Layout layout = item.layout;
 
-            // 文本最宽一行决定气泡实际宽度（气泡包住文字，微信风格）
-            int textW = 0;
-            for (TextLayout line : layout.lines) {
-                textW = Math.max(textW, (int) Math.ceil(line.getAdvance()));
+            // 气泡宽度：文本按最宽一行，图片按布局好的显示宽度（都包住内容，微信风格）
+            int bubbleW;
+            if (m.image != null) {
+                bubbleW = Math.min(maxBubbleWidth, layout.imageW + 24);
+            } else {
+                int textW = 0;
+                for (TextLayout line : layout.lines) {
+                    textW = Math.max(textW, (int) Math.ceil(line.getAdvance()));
+                }
+                bubbleW = Math.min(maxBubbleWidth, textW + 24);
             }
-            int bubbleW = Math.min(maxBubbleWidth, textW + 24);
             int bubbleH = layout.totalTextHeight + 8;
 
             // 自己的消息：头像在右侧，气泡在头像左侧；对方消息：头像在左侧，气泡在右侧
@@ -474,19 +558,13 @@ public class bubbleChatList extends JPanel {
             }
             y = 4 + 18; // 气泡在昵称行下方开始（双方一致）
 
-            // 头像（自己右侧 / 对方左侧，颜色按用户名稳定分配）
-            g2.setColor(chatTheme.getColorForUser(m.sender));
-            g2.fillOval(avatarX, y, 30, 30);
-            g2.setColor(Color.WHITE);
-            g2.setFont(new Font("Microsoft YaHei", Font.BOLD, 13));
-            FontMetrics fm = g2.getFontMetrics();
-            String initial = m.sender.isEmpty() ? "?" : m.sender.substring(0, 1).toUpperCase();
-            g2.drawString(initial, avatarX + 15 - fm.stringWidth(initial) / 2, y + 21);
+            // 头像（自己右侧 / 对方左侧）：有自定义头像画图，否则颜色+首字母
+            chatTheme.paintAvatar(g2, m.sender, avatarX, y, 30);
 
             // 气泡上方显示昵称：对方靠左，自己靠右对齐，与气泡两侧对称
             g2.setColor(META_TEXT);
             g2.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
-            fm = g2.getFontMetrics();
+            FontMetrics fm = g2.getFontMetrics();
             if (m.mine) {
                 g2.drawString(m.sender, bubbleX + bubbleW - fm.stringWidth(m.sender), y - 4);
             } else {
@@ -497,13 +575,22 @@ public class bubbleChatList extends JPanel {
             g2.setColor(m.mine ? BUBBLE_MINE_BG : BUBBLE_OTHER_BG);
             g2.fill(new RoundRectangle2D.Float(bubbleX, y, bubbleW, bubbleH, 12, 12));
 
-            // 文本
-            float textY = y + 4;
-            float textX = bubbleX + 12;
-            g2.setFont(getFont());
-            for (TextLayout line : layout.lines) {
-                line.draw(g2, textX, textY + line.getAscent());
-                textY += line.getAscent() + line.getDescent() + line.getLeading();
+            if (m.image != null) {
+                // 图片：圆角裁切绘制（内边距 4），与气泡圆角一致
+                Shape oldClip = g2.getClip();
+                g2.setClip(new RoundRectangle2D.Float(bubbleX + 4, y + 4,
+                        layout.imageW, layout.imageH, 8, 8));
+                g2.drawImage(m.image, bubbleX + 4, y + 4, layout.imageW, layout.imageH, null);
+                g2.setClip(oldClip);
+            } else {
+                // 文本
+                float textY = y + 4;
+                float textX = bubbleX + 12;
+                g2.setFont(getFont());
+                for (TextLayout line : layout.lines) {
+                    line.draw(g2, textX, textY + line.getAscent());
+                    textY += line.getAscent() + line.getDescent() + line.getLeading();
+                }
             }
 
             // 时间
@@ -537,6 +624,12 @@ public class bubbleChatList extends JPanel {
     public static BubbleMsg bubble(String sender, String msgId, long timestamp, String content,
                                    boolean mine, boolean canRecall, String mentionName) {
         return new BubbleMsg(sender, msgId, timestamp, content, mine, canRecall, mentionName);
+    }
+
+    /** 图片消息气泡（image 已解码，content 仍存 [IMG]Base64 原文） */
+    public static BubbleMsg bubbleImage(String sender, String msgId, long timestamp, String content,
+                                        boolean mine, boolean canRecall, Image image) {
+        return new BubbleMsg(sender, msgId, timestamp, content, mine, canRecall, null, image);
     }
 
     public static String recallText(String byWho, boolean mine) {

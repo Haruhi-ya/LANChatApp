@@ -71,8 +71,11 @@ public class searchDialog extends JFrame {
         setVisible(true);
     }
 
-    /** 追加一条搜索结果 */
+    /** 追加一条搜索结果（图片消息显示为 [图片]，不把 Base64 原文灌进列表） */
     public void addResult(String sender, long timestamp, String content) {
+        if (chatTheme.isImageContent(content)) {
+            content = "[图片]";
+        }
         resultModel.addElement("[" + chatTheme.formatTime(timestamp) + "] " + sender + ": " + content);
         resultList.ensureIndexIsVisible(resultModel.size() - 1);
     }

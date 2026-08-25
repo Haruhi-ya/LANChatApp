@@ -1,5 +1,6 @@
 package chatPackage;
 
+import javax.imageio.ImageIO;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.sound.sampled.AudioFormat;
@@ -9,8 +10,16 @@ import javax.sound.sampled.LineUnavailableException;
 import java.awt.*;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.geom.Ellipse2D;
 import java.awt.geom.RoundRectangle2D;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.text.SimpleDateFormat;
+import java.util.Base64;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.Set;
@@ -48,6 +57,28 @@ public final class chatTheme {
     public static final Color BORDER = new Color(220, 225, 235);
     public static final Color UNREAD_RED = new Color(240, 71, 71);
     public static final Color DANGER = new Color(220, 60, 60);
+
+    // ===== 图片消息与头像 =====
+
+    /** 图片消息内容前缀：content = IMG_PREFIX + Base64(图片字节)，协议命令本身零改动 */
+    public static final String IMG_PREFIX = "[IMG]";
+
+    /** 图片消息的图片大小上限（原始字节），超限客户端拒绝发送 */
+    public static final long MAX_IMAGE_MESSAGE_BYTES = 1024 * 1024;
+
+    /** 发送前图片长边压缩目标（像素），微信风格，控制传输体积 */
+    public static final int IMAGE_MAX_EDGE = 1280;
+
+    /** 头像图片大小上限（原始字节），超限服务端拒绝 */
+    public static final long MAX_AVATAR_BYTES = 128 * 1024;
+
+    /** 头像存储尺寸（像素），上传前压缩到该尺寸内 */
+    public static final int AVATAR_MAX_EDGE = 128;
+
+    /** 解码后图片的最大像素数（防御超大扁平图在渲染缩放时撑爆内存） */
+    private static final long MAX_DECODED_PIXELS = 16_000_000L;
+
+    private static volatile BufferedImage placeholderImage;
 
     /** 表情面板可选的表情 */
     public static final String[] EMOJIS = {"😀", "😂", "🤣", "😊", "😍", "🥰", "😘", "😎",
@@ -237,18 +268,270 @@ public final class chatTheme {
         return popup;
     }
 
-    /** 圆形头像标签，底色是用户专属颜色，显示用户名首字母 */
-    public static JLabel createAvatarLabel(String username, int size, int fontSize) {
-        JLabel label = new JLabel();
-        label.setPreferredSize(new Dimension(size, size));
-        label.setHorizontalAlignment(SwingConstants.CENTER);
-        label.setFont(new Font("Microsoft YaHei", Font.BOLD, fontSize));
-        label.setForeground(Color.WHITE);
-        label.setOpaque(true);
-        label.setBackground(getColorForUser(username));
-        label.setText(username.isEmpty() ? "?" : username.substring(0, 1).toUpperCase());
-        label.setToolTipText(username);
-        return label;
+    /** 圆形头像标签：有头像画图片（圆形裁剪），无头像回退「底色 + 首字母」。自绘组件 */
+    public static AvatarLabel createAvatarLabel(String username, int size, int fontSize) {
+        return new AvatarLabel(username, size, fontSize);
+    }
+
+    /**
+     * 自绘头像标签。原来用 setText/setBackground 的调用点改为 setUsername 后自绘：
+     * 头像图片加载/变更后只需 repaint()，JLabel 的文本状态与头像绘制完全解耦。
+     */
+    public static class AvatarLabel extends JLabel {
+        private final int size;
+        private final int fontSize;
+        private String username;
+
+        AvatarLabel(String username, int size, int fontSize) {
+            this.username = username;
+            this.size = size;
+            this.fontSize = fontSize;
+            setPreferredSize(new Dimension(size, size));
+            setHorizontalAlignment(SwingConstants.CENTER);
+            setToolTipText(username);
+        }
+
+        public void setUsername(String username) {
+            this.username = username;
+            setToolTipText(username);
+            repaint();
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            paintAvatar(g2, username, 0, 0, size, fontSize);
+            g2.dispose();
+        }
+    }
+
+    // ===== 头像：拉取、缓存与绘制 =====
+
+    /**
+     * 头像来源接口：由主聊天窗口在构造时注册（clientChatUI.setAvatarProvider）。
+     * 头像数据按需拉取——绘制组件发现未缓存时通过 fetch 异步发起 GETAVATAR，
+     * 响应到达后 cacheAvatar 写入缓存，再统一重绘。
+     */
+    public interface AvatarProvider {
+        void fetch(String username);
+    }
+
+    /**
+     * 头像缓存与版本管理。
+     *
+     * 版本号解决「快速连改两次头像」的竞态：每次变更（onAvatarChanged）版本 +1，
+     * 触发拉取时记录当时的版本，响应到达时版本已变则丢弃（陈旧数据覆盖新头像）。
+     *
+     * 负缓存：版本存在但图片不存在 = 已拉取过且确实无头像。这样无头像用户不会被
+     * 每次绘制反复 GETAVATAR（用户列表重绘会触发的拉取风暴）。
+     */
+    private static volatile AvatarProvider avatarProvider;
+    private static final ConcurrentHashMap<String, BufferedImage> AVATAR_IMAGES = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Long> AVATAR_VERSIONS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Long> AVATAR_PENDING = new ConcurrentHashMap<>(); // 拉取中:用户名->发起时版本
+
+    /** 注册头像来源（只由 clientChatUI 构造器调用一次） */
+    public static void setAvatarProvider(AvatarProvider provider) {
+        avatarProvider = provider;
+    }
+
+    /** 头像变更通知（AVATARCHG 到达）：清缓存并递增版本，旧响应从此作废 */
+    public static void onAvatarChanged(String username) {
+        AVATAR_VERSIONS.merge(username, 1L, Long::sum);
+        AVATAR_IMAGES.remove(username);
+        AVATAR_PENDING.remove(username);
+    }
+
+    /**
+     * 写入拉取结果。bmp 为 null 表示「该用户确实没有头像」，只落版本负缓存。
+     * 返回是否写入成功（false = 版本已过期，数据陈旧被丢弃）。
+     */
+    public static boolean cacheAvatar(String username, BufferedImage bmp) {
+        Long pendingVersion = AVATAR_PENDING.remove(username);
+        if (pendingVersion == null
+                || pendingVersion != AVATAR_VERSIONS.getOrDefault(username, 0L)) {
+            return false; // 拉取期间头像又变了，陈旧数据，丢弃
+        }
+        if (bmp != null) {
+            AVATAR_IMAGES.put(username, bmp);
+        }
+        return true;
+    }
+
+    /**
+     * 取用户头像原图。未缓存（含负缓存）时返回 null 并触发按需拉取：
+     *  - 从未拉过 → 记录当前版本并发起 GETAVATAR
+     *  - 负缓存（版本在、图不在）→ 不再重复拉取
+     * 返回的图是 128px 原图，调用方按目标尺寸 drawImage 自行缩放。
+     */
+    public static BufferedImage getAvatarImage(String username) {
+        Long version = AVATAR_VERSIONS.get(username);
+        if (version == null) {
+            // 首次见到这个用户：发起拉取，绘制端先画首字母占位
+            long v = AVATAR_VERSIONS.computeIfAbsent(username, k -> 1L);
+            AVATAR_PENDING.put(username, v);
+            AvatarProvider p = avatarProvider;
+            if (p != null) {
+                p.fetch(username);
+            }
+            return null;
+        }
+        return AVATAR_IMAGES.get(username); // null = 负缓存（无头像）
+    }
+
+    /**
+     * 画圆形头像：有头像画图，无头像回退「用户色底 + 首字母」。
+     * 供 bubbleChatList 的气泡渲染复用，保证所有头像视觉一致。
+     */
+    public static void paintAvatar(Graphics2D g2, String username, int x, int y, int size) {
+        paintAvatar(g2, username, x, y, size, Math.max(10, size * 13 / 30));
+    }
+
+    public static void paintAvatar(Graphics2D g2, String username, int x, int y, int size, int fontSize) {
+        BufferedImage img = getAvatarImage(username);
+        if (img != null) {
+            // 圆形裁剪 + 细白描边，微信风格
+            Shape oldClip = g2.getClip();
+            g2.setClip(new Ellipse2D.Float(x, y, size, size));
+            g2.drawImage(img, x, y, size, size, null);
+            g2.setClip(oldClip);
+            g2.setColor(Color.WHITE);
+            g2.drawOval(x, y, size, size);
+            return;
+        }
+        g2.setColor(getColorForUser(username));
+        g2.fillOval(x, y, size, size);
+        g2.setColor(Color.WHITE);
+        g2.setFont(new Font("Microsoft YaHei", Font.BOLD, fontSize));
+        FontMetrics fm = g2.getFontMetrics();
+        String initial = username.isEmpty() ? "?" : username.substring(0, 1).toUpperCase();
+        g2.drawString(initial, x + size / 2 - fm.stringWidth(initial) / 2,
+                y + size / 2 + (fm.getAscent() - fm.getDescent()) / 2);
+    }
+
+    // ===== 图片消息：编解码工具 =====
+
+    /** content 是否为图片消息（[IMG] 前缀） */
+    public static boolean isImageContent(String content) {
+        return content != null && content.startsWith(IMG_PREFIX);
+    }
+
+    /**
+     * 解码图片消息内容。非图片消息返回 null；Base64 非法 / 非图片 / 超像素上限
+     * 一律返回 null（渲染端回退占位符），不抛异常。
+     */
+    public static BufferedImage decodeImageMessage(String content) {
+        if (!isImageContent(content)) {
+            return null;
+        }
+        try {
+            byte[] data = Base64.getDecoder().decode(content.substring(IMG_PREFIX.length()));
+            if (data.length > MAX_IMAGE_MESSAGE_BYTES) {
+                return null;
+            }
+            BufferedImage img = ImageIO.read(new ByteArrayInputStream(data));
+            if (img == null) {
+                return null;
+            }
+            // 防御超扁平大图（如 10000x10000 的 PNG 只有几十 KB，渲染缩放时才炸内存）
+            if ((long) img.getWidth() * img.getHeight() > MAX_DECODED_PIXELS) {
+                return null;
+            }
+            return img;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 从文件构造图片消息内容（[IMG]+Base64）：限 1MB、长边压缩到 1280px。
+     * 有透明通道用 PNG（保持透明），否则 JPEG 压缩体积。
+     */
+    public static String buildImageMessage(File file) throws IOException {
+        byte[] raw = Files.readAllBytes(file.toPath());
+        if (raw.length > MAX_IMAGE_MESSAGE_BYTES) {
+            throw new IOException("图片超过 1MB 限制，请选择更小的图片");
+        }
+        BufferedImage src = ImageIO.read(new ByteArrayInputStream(raw));
+        if (src == null) {
+            throw new IOException("无法识别的图片格式（仅支持 JPG / PNG）");
+        }
+        BufferedImage scaled = scaleToMaxEdge(src, IMAGE_MAX_EDGE);
+        byte[] data = encodeImage(scaled, scaled.getColorModel().hasAlpha());
+        return IMG_PREFIX + Base64.getEncoder().encodeToString(data);
+    }
+
+    /** 从文件构造头像字节：压缩到 128px 边长内，统一 PNG（支持透明） */
+    public static byte[] buildAvatarBytes(File file) throws IOException {
+        BufferedImage src = ImageIO.read(file);
+        if (src == null) {
+            throw new IOException("无法识别的图片格式（仅支持 JPG / PNG）");
+        }
+        BufferedImage scaled = scaleToMaxEdge(src, AVATAR_MAX_EDGE);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        ImageIO.write(scaled, "png", out);
+        if (out.size() > MAX_AVATAR_BYTES) {
+            throw new IOException("头像文件过大，请换一张更小的图片");
+        }
+        return out.toByteArray();
+    }
+
+    /**
+     * 图片加载失败的占位图（[IMG] 消息解码失败时渲染它，避免把 Base64 垃圾当文本显示）。
+     * 懒创建，线程安全（并发下重复创建无害，仅多一次分配）。
+     */
+    public static BufferedImage placeholderImage() {
+        BufferedImage img = placeholderImage;
+        if (img == null) {
+            img = new BufferedImage(160, 120, BufferedImage.TYPE_INT_RGB);
+            Graphics2D g = img.createGraphics();
+            g.setColor(new Color(235, 238, 245));
+            g.fillRect(0, 0, 160, 120);
+            g.setColor(TEXT_GRAY);
+            g.setFont(getChatFont(13));
+            String text = "图片加载失败";
+            FontMetrics fm = g.getFontMetrics();
+            g.drawString(text, (160 - fm.stringWidth(text)) / 2, (120 + fm.getAscent() - fm.getDescent()) / 2);
+            g.dispose();
+            placeholderImage = img;
+        }
+        return img;
+    }
+
+    /** 等比缩到最长边不超过 maxEdge（保持透明通道） */
+    private static BufferedImage scaleToMaxEdge(BufferedImage src, int maxEdge) {
+        int w = src.getWidth(), h = src.getHeight();
+        if (w <= maxEdge && h <= maxEdge) {
+            return src;
+        }
+        double scale = Math.min(maxEdge / (double) w, maxEdge / (double) h);
+        int nw = Math.max(1, (int) (w * scale));
+        int nh = Math.max(1, (int) (h * scale));
+        BufferedImage out = new BufferedImage(nw, nh, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = out.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        g.drawImage(src, 0, 0, nw, nh, null);
+        g.dispose();
+        return out;
+    }
+
+    /** 按是否有透明通道选格式编码（JPEG 压缩率高，PNG 保透明） */
+    private static byte[] encodeImage(BufferedImage img, boolean alpha) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        if (!alpha) {
+            // JPEG 不吃 alpha，先转 RGB 再写
+            BufferedImage rgb = new BufferedImage(img.getWidth(), img.getHeight(), BufferedImage.TYPE_INT_RGB);
+            Graphics2D g = rgb.createGraphics();
+            g.setColor(Color.WHITE);
+            g.fillRect(0, 0, rgb.getWidth(), rgb.getHeight());
+            g.drawImage(img, 0, 0, null);
+            g.dispose();
+            ImageIO.write(rgb, "jpg", out);
+        } else {
+            ImageIO.write(img, "png", out);
+        }
+        return out.toByteArray();
     }
 
     // ===== 提示音 =====

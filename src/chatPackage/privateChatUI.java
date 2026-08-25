@@ -2,9 +2,11 @@ package chatPackage;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
+import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -38,6 +40,7 @@ public class privateChatUI extends JFrame implements bubbleChatList.MenuHandler 
     private JButton clearButton;
     private JLabel statusLabel;
     private JPopupMenu emojiPopup;
+    private chatTheme.AvatarLabel peerAvatarLabel;
 
     /**
      * 历史是否加载完毕。加载期间到达的实时消息先存进 pending，等 PMHISTEND 到达后
@@ -45,7 +48,7 @@ public class privateChatUI extends JFrame implements bubbleChatList.MenuHandler 
      * PrintWriter 只保证单行不撕裂，不保证跨行顺序，不缓冲会出现重复或乱序。
      */
     private boolean historyLoaded;
-    private final List<Object[]> pending = new ArrayList<>(); // {sender, msgId, ts, content}
+    private final List<Object[]> pending = new ArrayList<>(); // {sender, msgId, ts, content, img}
     private final Set<String> recalledDuringLoad = ConcurrentHashMap.newKeySet();
     private Timer historyTimeout;
 
@@ -138,7 +141,8 @@ public class privateChatUI extends JFrame implements bubbleChatList.MenuHandler 
 
         JPanel left = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
         left.setOpaque(false);
-        left.add(chatTheme.createAvatarLabel(peer, 32, 15));
+        peerAvatarLabel = chatTheme.createAvatarLabel(peer, 32, 15);
+        left.add(peerAvatarLabel);
 
         JLabel nameLabel = new JLabel(peer);
         nameLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 15));
@@ -169,9 +173,12 @@ public class privateChatUI extends JFrame implements bubbleChatList.MenuHandler 
 
         JButton emojiButton = chatTheme.createIconButton("😊", "表情");
         emojiButton.addActionListener(e -> emojiPopup.show(emojiButton, 0, emojiButton.getHeight()));
+        JButton imageButton = chatTheme.createIconButton("📷", "发送图片");
+        imageButton.addActionListener(e -> chooseAndSendImage());
         JPanel leftGroup = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
         leftGroup.setOpaque(false);
         leftGroup.add(emojiButton);
+        leftGroup.add(imageButton);
         panel.add(leftGroup, BorderLayout.WEST);
 
         inputField = chatTheme.createInputField();
@@ -241,7 +248,8 @@ public class privateChatUI extends JFrame implements bubbleChatList.MenuHandler 
         if (recalledDuringLoad.contains(msgId)) {
             return;
         }
-        appendBubble(sender, msgId, timestamp, content);
+        Image img = chatTheme.decodeImageMessage(content);
+        appendBubble(sender, msgId, timestamp, content, img);
     }
 
     /** 收到 PMHISTEND：补渲染加载期间缓冲的实时消息 */
@@ -255,7 +263,7 @@ public class privateChatUI extends JFrame implements bubbleChatList.MenuHandler 
         }
         for (Object[] m : pending) {
             if (!recalledDuringLoad.contains(m[1])) {
-                appendBubble((String) m[0], (String) m[1], (Long) m[2], (String) m[3]);
+                appendBubble((String) m[0], (String) m[1], (Long) m[2], (String) m[3], (Image) m[4]);
             }
         }
         pending.clear();
@@ -266,10 +274,16 @@ public class privateChatUI extends JFrame implements bubbleChatList.MenuHandler 
 
     // ===== 气泡：构造与撤回 =====
 
-    private void appendBubble(String sender, String msgId, long timestamp, String content) {
+    private void appendBubble(String sender, String msgId, long timestamp, String content, Image img) {
         boolean mine = sender.equals(myName);
         boolean canRecall = mine && !msgId.isEmpty();
-        chatList.addMessage(bubbleChatList.bubble(sender, msgId, timestamp, content, mine, canRecall));
+        if (chatTheme.isImageContent(content)) {
+            // 解码失败用占位图，避免 Base64 当文本渲染
+            chatList.addMessage(bubbleChatList.bubbleImage(sender, msgId, timestamp, content,
+                    mine, canRecall, img != null ? img : chatTheme.placeholderImage()));
+        } else {
+            chatList.addMessage(bubbleChatList.bubble(sender, msgId, timestamp, content, mine, canRecall));
+        }
     }
 
     @Override
@@ -300,11 +314,13 @@ public class privateChatUI extends JFrame implements bubbleChatList.MenuHandler 
 
     /** 收到一条实时私聊消息（历史还没加载完时先缓冲，避免与回放交错） */
     public void appendMessage(String sender, String msgId, long timestamp, String content) {
+        // 图片解码放接收线程（调用方是 chatClient 回调链，未切 EDT）
+        Image img = chatTheme.decodeImageMessage(content);
         if (!historyLoaded) {
-            pending.add(new Object[]{sender, msgId, timestamp, content});
+            pending.add(new Object[]{sender, msgId, timestamp, content, img});
             return;
         }
-        appendBubble(sender, msgId, timestamp, content);
+        appendBubble(sender, msgId, timestamp, content, img);
     }
 
     public void appendSystemMessage(String message) {
@@ -352,5 +368,29 @@ public class privateChatUI extends JFrame implements bubbleChatList.MenuHandler 
 
     public void focusInput() {
         inputField.requestFocusInWindow();
+    }
+
+    /** 头像缓存变化后刷新本窗口的头像显示（由主窗口 refreshAllAvatars 统一调用） */
+    public void refreshAvatars() {
+        chatList.repaintTable();
+        if (peerAvatarLabel != null) {
+            peerAvatarLabel.repaint();
+        }
+    }
+
+    private void chooseAndSendImage() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("选择要发送的图片（JPG / PNG，≤1MB）");
+        chooser.setFileFilter(new FileNameExtensionFilter("图片文件 (jpg, png)", "jpg", "jpeg", "png"));
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+        try {
+            // 与公共频道同一条 [IMG]Base64 管道，由服务端回显后统一渲染
+            client.sendPrivate(peer, chatTheme.buildImageMessage(chooser.getSelectedFile()));
+        } catch (IOException ex) {
+            JOptionPane.showMessageDialog(this, "发送失败：" + ex.getMessage(),
+                    "发送图片", JOptionPane.WARNING_MESSAGE);
+        }
     }
 }

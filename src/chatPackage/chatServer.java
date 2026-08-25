@@ -15,6 +15,7 @@ import java.nio.file.Paths;
 import java.sql.SQLException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
@@ -97,6 +98,15 @@ public class chatServer {
 
     /** 单条消息内容长度上限（字符数），超出部分截断 */
     private static final int MAX_MSG_LEN = 2000;
+
+    /**
+     * 图片消息内容长度上限（字符数）：Base64 膨胀 4/3，1MB 图片约 1.4M 字符。
+     * 图片消息不走 MAX_MSG_LEN 截断（截断会破坏 Base64），而是整体校验后拒绝。
+     */
+    private static final int MAX_IMG_MSG_LEN = 1_500_000;
+
+    /** 头像 Base64 上限（字符数）：对应 chatTheme.MAX_AVATAR_BYTES 128KB */
+    private static final int MAX_AVATAR_B64_LEN = 512_000;
 
     /** 消息撤回时间窗口（毫秒），超过后服务端拒绝撤回 */
     private static final long RECALL_WINDOW_MS = 2 * 60 * 1000L;
@@ -219,7 +229,44 @@ public class chatServer {
      */
     private static String sanitize(String content) {
         String s = content.replace('\r', ' ').replace('\n', ' ').trim();
+        if (s.startsWith(chatTheme.IMG_PREFIX)) {
+            return sanitizeImageMessage(s);
+        }
         return s.length() > MAX_MSG_LEN ? s.substring(0, MAX_MSG_LEN) : s;
+    }
+
+    /**
+     * 图片消息校验：整体放行到 MAX_IMG_MSG_LEN，并验证 Base64 合法 + 图片魔数。
+     *
+     * 图片消息不能像文本那样截断——截断破坏 Base64，解码必然失败。所以这里整体
+     * 校验，任何一项不过关返回空串，调用方按「内容为空」丢弃，不留半截数据入库。
+     * 手打文本 "[IMG]hello" 也会被魔数校验挡住。
+     */
+    private static String sanitizeImageMessage(String s) {
+        if (s.length() > MAX_IMG_MSG_LEN) {
+            return "";
+        }
+        byte[] data;
+        try {
+            data = Base64.getDecoder().decode(s.substring(chatTheme.IMG_PREFIX.length()));
+        } catch (IllegalArgumentException e) {
+            return "";
+        }
+        if (data.length < 4 || data.length > chatTheme.MAX_IMAGE_MESSAGE_BYTES) {
+            return "";
+        }
+        // 魔数校验：JPEG 以 FFD8FF 开头，PNG 以 89504E47 开头
+        boolean jpeg = (data[0] & 0xFF) == 0xFF && (data[1] & 0xFF) == 0xD8 && (data[2] & 0xFF) == 0xFF;
+        boolean png = (data[0] & 0xFF) == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47;
+        return (jpeg || png) ? s : "";
+    }
+
+    /** 日志摘要：图片消息只记类型与大小，避免 1.4M 字符的 Base64 刷屏 */
+    private static String logSummary(String content) {
+        if (content.startsWith(chatTheme.IMG_PREFIX)) {
+            return "[图片] (" + (content.length() - chatTheme.IMG_PREFIX.length()) * 3 / 4 + " 字节)";
+        }
+        return content;
     }
 
     /**
@@ -304,9 +351,88 @@ public class chatServer {
                 handleKick(line.substring("KICK:".length()).trim());
             } else if (line.startsWith("BAN:")) {
                 handleBan(line.substring("BAN:".length()).trim());
+            } else if (line.startsWith("GETAVATAR:")) {
+                handleGetAvatar(line.substring("GETAVATAR:".length()).trim());
+            } else if (line.startsWith("SETAVATAR:")) {
+                handleSetAvatar(line.substring("SETAVATAR:".length()).trim());
             } else if (line.equals("LOGOUT")) {
                 disconnect(); // 主动退出，关闭连接后读取循环自然结束
             }
+        }
+
+        // ===== 头像 =====
+
+        /**
+         * 拉取用户头像：GETAVATAR:用户名
+         * 响应 AVATAR:用户名:base64（未设置头像时 base64 为空字段）。
+         * 数据按需拉取，不进 USERS 广播，避免用户列表刷新时重复传输。
+         */
+        private void handleGetAvatar(String target) {
+            if (!isValidName(target)) {
+                return;
+            }
+            try {
+                byte[] avatar = db.getAvatar(target);
+                String b64 = avatar == null || avatar.length == 0
+                        ? "" : Base64.getEncoder().encodeToString(avatar);
+                sendTo(this, "AVATAR:" + target + ":" + b64);
+            } catch (SQLException e) {
+                System.err.println("读取头像失败：" + e.getMessage());
+                sendTo(this, "AVATAR:" + target + ":");
+            }
+        }
+
+        /**
+         * 上传/移除自己的头像：SETAVATAR:base64（空 = 移除）
+         * 成功回 AVATAROK 并广播 AVATARCHG:用户名（各客户端清缓存后按需重拉）；
+         * 失败回 AVATARFAIL:原因。
+         */
+        private void handleSetAvatar(String b64) {
+            if (b64.isEmpty()) {
+                try {
+                    db.setAvatar(nickname, null);
+                } catch (SQLException e) {
+                    System.err.println("清除头像失败：" + e.getMessage());
+                    sendTo(this, "AVATARFAIL:清除头像失败，请稍后再试");
+                    return;
+                }
+                broadcast("AVATARCHG:" + nickname);
+                sendTo(this, "AVATAROK");
+                log(nickname + " 移除了头像");
+                return;
+            }
+            if (b64.length() > MAX_AVATAR_B64_LEN) {
+                sendTo(this, "AVATARFAIL:头像文件过大（上限 128KB）");
+                return;
+            }
+            byte[] data;
+            try {
+                data = Base64.getDecoder().decode(b64);
+            } catch (IllegalArgumentException e) {
+                sendTo(this, "AVATARFAIL:头像数据格式错误");
+                return;
+            }
+            if (data.length > chatTheme.MAX_AVATAR_BYTES) {
+                sendTo(this, "AVATARFAIL:头像文件过大（上限 128KB）");
+                return;
+            }
+            // 魔数校验，防止把任意二进制当头像存进库
+            boolean jpeg = (data[0] & 0xFF) == 0xFF && (data[1] & 0xFF) == 0xD8 && (data[2] & 0xFF) == 0xFF;
+            boolean png = (data[0] & 0xFF) == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47;
+            if (!jpeg && !png) {
+                sendTo(this, "AVATARFAIL:头像必须是 JPG 或 PNG 图片");
+                return;
+            }
+            try {
+                db.setAvatar(nickname, data);
+            } catch (SQLException e) {
+                System.err.println("保存头像失败：" + e.getMessage());
+                sendTo(this, "AVATARFAIL:保存头像失败，请稍后再试");
+                return;
+            }
+            broadcast("AVATARCHG:" + nickname);
+            sendTo(this, "AVATAROK");
+            log(nickname + " 更新了头像（" + data.length + " 字节）");
         }
 
         /**
@@ -331,7 +457,7 @@ public class chatServer {
             broadcast("MSG:" + nickname + ":" + saved.msgId + ":" + saved.timestamp + ":" + content);
             // @提醒放在广播之后发送，保证被@的人先渲染出消息再闪窗
             notifyMentioned(content);
-            log(nickname + " 说：" + content);
+            log(nickname + " 说：" + logSummary(content));
         }
 
         /**
@@ -344,6 +470,10 @@ public class chatServer {
          * 同一消息 @ 同一人只提醒一次；不提醒自己；只提醒在线用户。
          */
         private void notifyMentioned(String content) {
+            // 图片消息是 Base64 文本，既没有 @ 语义，扫描超大字符串 × N 用户还会卡
+            if (content.startsWith(chatTheme.IMG_PREFIX)) {
+                return;
+            }
             Set<String> mentioned = new HashSet<>();
             for (String name : clients.keySet()) {
                 if (name.equals(nickname) || mentioned.contains(name)) {
@@ -504,7 +634,7 @@ public class chatServer {
             } else {
                 sendTo(this, "SYSTEM:「" + target + "」当前离线，消息将在其上线后送达");
             }
-            log(nickname + " 私聊 " + target + "：" + content);
+            log(nickname + " 私聊 " + target + "：" + logSummary(content));
         }
 
         /**
