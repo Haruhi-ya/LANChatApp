@@ -78,7 +78,6 @@ public class dbManager {
                 }
             }
         }
-
         // 初始化管理员账号（INSERT IGNORE：已存在则不覆盖，密码不会被重置）
         try (PreparedStatement ps = conn.prepareStatement(
                 "INSERT IGNORE INTO Users(username, password, role) VALUES (?, ?, 'admin')")) {
