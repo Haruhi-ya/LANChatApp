@@ -7,6 +7,7 @@ out/
 ### 构建产物 ###
 build/
 release/
+release.zip
 
 ### 数据库配置（含真实密码，禁止提交） ###
 config.properties

@@ -177,12 +177,31 @@ public class chatServer {
     }
 
     /**
-     * 从项目根目录的 config.properties 读取数据库配置。
+     * 读取数据库配置，优先级：jar 同目录的 config.properties > 工作目录的 config.properties > 默认值。
+     *
+     * 之前只用 Paths.get("config.properties")（相对工作目录），把 jar 单独拷到别的目录
+     * 用 java -jar 启动时工作目录不是 jar 所在目录，配置读不到，服务端会因连不上 MySQL 中止。
+     * 现在优先取 jar 同目录（与启动脚本 cd 到 jar 目录的语义一致，双击 bat 或裸跑 jar 都能读到）。
      * 文件不存在或读取失败时返回 null（继续用默认值）。
      * 该文件包含真实密码，已被 .gitignore 排除，不会提交到仓库。
      */
     private static Properties loadConfigFile() {
-        Path cfg = Paths.get("config.properties");
+        Path cfg = null;
+        try {
+            Path jarDir = Paths.get(chatServer.class.getProtectionDomain()
+                    .getCodeSource().getLocation().toURI()).getParent();
+            if (jarDir != null) {
+                Path beside = jarDir.resolve("config.properties");
+                if (Files.exists(beside)) {
+                    cfg = beside;
+                }
+            }
+        } catch (Exception ignored) {
+            // 拿不到 jar 位置时回退工作目录
+        }
+        if (cfg == null) {
+            cfg = Paths.get("config.properties");
+        }
         if (!Files.exists(cfg)) {
             return null;
         }
