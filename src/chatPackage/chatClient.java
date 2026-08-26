@@ -13,23 +13,26 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * 聊天室客户端网络层（与 chatServer 配对的客户端类）
+ * 聊天室客户端网络层（与 chatServer 配对）。
  *
  * 线程模型：
- *  - 接收线程（chat-client-receiver）：readLine() 循环持续读取服务端消息
- *  - 消息回调发生在接收线程上，UI 层必须在回调中通过 SwingUtilities.invokeLater 切回 EDT 再更新界面
+ *  - 连接建立后单独起一条接收线程（chat-client-receiver），循环 readLine() 读服务端消息
+ *  - 服务端消息回调都发生在接收线程上，UI 层收到回调后必须用
+ *    SwingUtilities.invokeLater 切回界面线程（EDT）再更新控件，直接在回调里改界面会报错
  *
  * 使用流程：
  *  chatClient client = new chatClient();
- *  client.connect(ip, port);      // 1. 建立 TCP 连接（可先设置监听器，也可后设置）
- *  client.setListener(ui);        // 2. 注册回调
- *  client.login(nickname);        // 3. 登录（在 UI 就绪后调用，避免漏掉服务端广播的消息）
- *  client.sendMessage(content);   // 4. 发消息
- *  client.logout();               // 5. 退出
+ *  client.connect(ip, port);         // 1. 建立 TCP 连接（监听器可以稍后再设）
+ *  client.setListener(ui);           // 2. 注册回调（登录结果、消息都通过回调通知）
+ *  client.login(username, password); // 3. 登录（要在 UI 就绪后调用，避免漏掉广播）
+ *  client.sendMessage(content);      // 4. 发消息
+ *  client.logout();                  // 5. 退出
  */
 public class chatClient {
 
-    /** 服务器消息回调接口（由 UI 层实现；新回调均为 default 实现，老实现无需改动） */
+    /** 服务器消息回调接口，由 UI 层实现。
+     *  新增的消息回调都用 default 实现，这样只关心部分消息的监听器
+     *  不用把接口里所有方法都实现一遍（比如登录界面的临时监听器）。 */
     public interface Listener {
         void onLoginResult(boolean success, String reason);   // LOGINOK / LOGINFAIL:原因
         void onRegisterResult(boolean success, String reason); // REGISTEROK / REGISTERFAIL:原因
@@ -127,18 +130,18 @@ public class chatClient {
     private volatile boolean notifiedDisconnect;
     private volatile Listener listener;
 
-    // 最近一次的状态缓存：
-    // 登录后的 LOGINOK/USERS/OFFLINEUSERS 广播到达时 UI 监听器可能还没挂载
-    // （登录界面先用临时监听器等待结果，之后再切换到聊天窗口监听器），
-    // 缓存下来并在 setListener 时补发，保证挂上监听器就能立即拿到角色和用户列表
+    // 最近一次的状态缓存：登录结果、用户列表这些广播到达时，UI 监听器可能还没挂上
+    // （登录界面先用临时监听器等登录结果，之后才换成聊天窗口的监听器），
+    // 所以先缓存下来，setListener 时补发，保证挂上监听器立刻能拿到角色和用户列表
     private volatile String lastRole;
     private volatile String[] lastOnlineUsers;
     private volatile String[] lastOfflineUsers;
 
     /**
      * 建立与服务端的 TCP 连接，并启动接收线程。
-     * 注意：这里不发送 LOGIN，登录由 UI 就绪后调用 {@link #login(String)} 完成，
-     * 这样能保证注册监听器之前不会丢消息（服务端只在收到 LOGIN 后才开始广播）。
+     * 注意：这里不马上发 LOGIN，登录要在 UI 就绪、监听器挂上之后调用
+     * （{@link #login(String)}）——服务端收到 LOGIN 才开始广播，
+     * 先挂好监听器再登录，就不会丢消息。
      */
     public void connect(String ip, int port) throws IOException {
         socket = new Socket();
@@ -154,8 +157,8 @@ public class chatClient {
 
     public void setListener(Listener listener) {
         this.listener = listener;
-        // 补发缓存的状态，避免监听器挂载前到达的广播丢失
-        // （修复登录后列表迟迟不显示、管理员角色丢失的问题）
+        // 把之前缓存的状态补发给新监听器，不然会出现登录后用户列表迟迟不显示、
+        // 管理员身份丢失这类问题（都是监听器挂载时机不对导致的）
         if (listener != null) {
             if (lastRole != null) {
                 listener.onRole(lastRole);
@@ -270,14 +273,13 @@ public class chatClient {
     }
 
     /**
-     * 发送一行协议消息。所有发送都经过这里，因此在这里统一剔除换行符。
+     * 发送一行协议消息。所有发送都走这里，所以统一在这里把换行符过滤掉。
      *
-     * 协议是「每行一条命令」，服务端 readLine() 会把 \r、\n、\r\n 都当行结束符。
-     * 内容里混进换行符就会被拆成两行，后半段被服务端当成独立命令执行（详见
-     * chatServer.sanitize 的注释）。注意 JTextField 只过滤 \n 不过滤 \r，
-     * 所以从 Windows 文本粘贴的内容确实会带 \r 过来。
-     *
-     * 这层只是客户端兜底，真正的收口在服务端——手工构造 socket 可以绕过这里。
+     * 协议是一行一条命令，服务端 readLine() 把 \r、\n、\r\n 都当行结束符，
+     * 内容里带换行符就会被拆成两行，后半段被服务端当成独立命令执行
+     * （详见 chatServer.sanitize 的注释）。Swing 的输入框只过滤 \n 不过滤 \r，
+     * 从 Windows 文本里复制粘贴的内容确实会带 \r 过来，所以必须在这里处理。
+     * 这层只是客户端兜底，真正的防线在服务端——手工构造 socket 能绕过这里。
      */
     private void sendLine(String line) {
         if (!connected || out == null) {
@@ -291,11 +293,11 @@ public class chatClient {
     }
 
     /**
-     * 按固定字段数切分协议消息：返回长度为 n+1 的数组，前 n 个是冒号分隔的固定字段，
-     * 最后一个是第 n 个冒号之后的全部内容（可以包含冒号）。字段不足时返回 null。
+     * 按固定字段数切分协议消息：返回 n+1 个字段，前 n 个是按冒号切的固定字段，
+     * 最后一个是第 n 个冒号之后的全部内容（可以含冒号）。字段不够时返回 null。
      *
-     * 不能用 line.split(":")：消息内容里的冒号会被当成分隔符，把内容截断。
-     * 用户名已由服务端禁止包含冒号，时间戳和计数是纯数字，所以前面的字段切分是安全的。
+     * 不能用 line.split(":")——内容里的冒号会被当成分隔符，把消息内容截断。
+     * 用户名已经由服务端禁止包含冒号，时间戳、计数都是纯数字，所以前面切分是安全的。
      *
      * @param body 已经去掉命令前缀的部分
      * @param n    内容之前的固定字段个数
@@ -326,9 +328,8 @@ public class chatClient {
 
     /**
      * 解析未读汇总：对方:数量,对方2:数量2
-     *
-     * 分隔符用逗号和冒号而不是等号：等号是合法用户名字符（服务端 isValidName 只禁了
-     * 冒号和逗号），用 a=3 的形式遇到名字里带等号的用户就无法无歧义解析了。
+     * 分隔符用逗号和冒号。不能用等号（比如 a=3）——等号是合法用户名字符，
+     * 用户名里带等号的用户会让解析产生歧义。
      */
     private static Map<String, Integer> parseUnread(String body) {
         Map<String, Integer> counts = new LinkedHashMap<>();

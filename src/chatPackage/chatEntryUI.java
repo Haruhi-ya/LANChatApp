@@ -10,6 +10,11 @@ import java.io.IOException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * 程序入口：登录/注册窗口。
+ * 整个程序的启动流程都在这：收集用户输入的服务器 IP、端口、账号密码，
+ * 起一个后台线程去连服务器，等登录结果回来后再切换到聊天主窗口。
+ */
 public class chatEntryUI extends JFrame {
 
     private JTextField usernameField;
@@ -399,10 +404,13 @@ public class chatEntryUI extends JFrame {
     }
 
     /**
-     * 后台线程连接服务器并提交登录/注册请求，等待服务端结果：
-     *  - 登录成功：打开聊天窗口
+     * 在后台线程里连接服务器并提交登录/注册请求，等服务端结果：
+     *  - 登录成功：打开聊天主窗口
      *  - 注册成功：提示后留在登录页
      *  - 失败：弹窗提示并恢复表单
+     *
+     * 为什么不能直接在点击按钮的方法里连服务器：connect() 要等 TCP 握手，
+     * 放在界面线程里做的话窗口会卡死（转圈、拖不动），所以放进 new Thread 里。
      */
     private void connectAndSubmit(String action, String username, String password,
                                   String ip, int portNum, boolean isLogin) {
@@ -412,11 +420,13 @@ public class chatEntryUI extends JFrame {
 
         new Thread(() -> {
             chatClient client = new chatClient();
+            // CountDownLatch(1)：等一个信号。登录结果是异步回调返回的，
+            // 回调一到达就 countDown()，下面的 await() 才会结束等待
             final CountDownLatch latch = new CountDownLatch(1);
             final boolean[] success = {false};
             final String[] reason = {""};
 
-            // 临时监听器：收集登录/注册结果，结果到达后放行等待
+            // 临时监听器：只收集登录/注册结果，结果到达后放行下面的等待
             client.setListener(new chatClient.Listener() {
                 @Override
                 public void onLoginResult(boolean ok, String r) { success[0] = ok; reason[0] = r; latch.countDown(); }
@@ -442,7 +452,8 @@ public class chatEntryUI extends JFrame {
                     client.register(username, password);
                 }
 
-                // 等待服务端返回结果，超时视为失败
+                // 等服务端返回结果（最多等 5 秒，超时按失败处理，
+                // 不然服务器没开的话这里会一直卡着）
                 if (!latch.await(RESPONSE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                     throw new IOException("服务器响应超时，请检查服务器是否正常运行");
                 }
@@ -455,9 +466,11 @@ public class chatEntryUI extends JFrame {
                     client.logout();
                 }
                 final chatClient connected = client;
+                // 现在在后台线程里，不能直接在这里 new 窗口/弹对话框，
+                // 必须切回界面线程（EDT）再做 UI 操作
                 SwingUtilities.invokeLater(() -> {
                     if (isLogin) {
-                        // 登录成功，打开聊天窗口（窗口构造时会注册正式的消息监听器）
+                        // 登录成功，打开聊天主窗口（窗口构造时会注册正式的消息监听器）
                         new clientChatUI(username, ip, portNum, connected).setVisible(true);
                         dispose();
                     } else {

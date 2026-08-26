@@ -30,63 +30,41 @@ import java.util.concurrent.ConcurrentHashMap;
  * 聊天室服务器
  *
  * 线程模型：
- *  - 主线程：ServerSocket.accept() 循环，只负责接收客户端的 socket 连接
- *  - 每个客户端连接：创建一条新线程（ClientHandler），持续读取该客户端发送的消息
+ *  - 主线程：ServerSocket.accept() 循环，只负责接收客户端连接
+ *  - 每个客户端连接：起一条新线程（ClientHandler），循环读取该客户端发来的消息
  *
- * 账号体系：用户注册信息保存在 MySQL 的 lanchat.Users 表中（username 主键，password 字段），
+ * 账号体系：用户信息存在 MySQL 的 lanchat.Users 表（username 主键），
  * 登录由服务器验证，离线用户列表（注册过但不在线）也从数据库读取。
  *
- * 简单文本协议（每行一条消息，UTF-8 编码）：
+ * 通信协议：自定义的简单文本协议，一行一条命令，UTF-8 编码，冒号分隔字段：
  *  客户端 -> 服务端：
- *    REGISTER:用户名:密码  注册新账号（用户名不能含冒号或逗号）
- *    LOGIN:用户名:密码     登录（验证通过后才算进入聊天室）
- *    MSG:消息内容          发送公共聊天消息
- *    KICK:用户名           管理员踢人（仅管理员有效）
- *    BAN:用户名            管理员封禁并从数据库删除用户（仅管理员有效）
- *    PM:对方:消息内容       发送私聊（对方在线或离线都可以发）
- *    PMHIST:对方           拉取与某人的私聊历史（服务端发完历史后标记已读）
- *    PMREAD:对方           标记与某人的私聊为已读（私聊窗口开着时收到消息后发）
- *    CLEARPM:对方          清空自己与某人的私聊记录（不影响对方那份）
- *    CLEARPUBLIC           清空公共聊天记录（仅管理员有效）
- *    HIST                  拉取公共聊天历史
- *    UNREAD                拉取未读私聊汇总
- *    RECALL:消息ID         撤回公共消息（只能撤自己的；管理员可撤任何人的）
- *    PMRECALL:对方:消息ID  撤回私聊消息（只能撤自己的）
- *    SEARCHPUB:关键词      搜索公共聊天记录
- *    SEARCHPM:对方:关键词  搜索与某人的私聊记录
- *    LOGOUT                主动退出
+ *    REGISTER:用户名:密码   注册
+ *    LOGIN:用户名:密码      登录（验证通过后才算进入聊天室）
+ *    MSG:内容               发公共消息
+ *    PM:对方:内容            发私聊（对方离线也入库，上线后能看到）
+ *    PMHIST:对方 / PMREAD:对方 / CLEARPM:对方   拉私聊历史 / 标记已读 / 清空私聊记录
+ *    HIST / UNREAD           拉公共历史 / 拉未读私聊汇总
+ *    RECALL:消息ID / PMRECALL:对方:消息ID    撤回公共 / 私聊消息（只能撤自己的）
+ *    KICK:用户名 / BAN:用户名 管理员踢人 / 封禁（仅管理员有效）
+ *    CLEARPUBLIC             管理员清空公共聊天记录
+ *    LOGOUT                  退出
  *  服务端 -> 客户端：
  *    REGISTEROK / REGISTERFAIL:原因
- *    LOGINOK:角色           登录成功，角色为 admin / user
- *    LOGINFAIL:原因
- *    KICKED:原因            本连接被管理员踢出（随后服务端会关闭连接）
- *    BANNED:原因            本连接被管理员封禁（随后服务端会关闭连接）
- *    SYSTEM:系统消息         通知类消息（有人加入/离开/被踢等）
- *    MSG:昵称:消息ID:时间戳:内容     公共聊天消息
- *    USERS:昵称1,昵称2       当前在线用户列表
- *    OFFLINEUSERS:昵称1,昵称2 已注册但不在线的用户列表
- *    HISTBEGIN / HISTITEM:昵称:消息ID:时间戳:内容 / HISTEND    公共历史回放
- *    PMMSG:对方:发送者:消息ID:时间戳:未读数:内容                 私聊消息实时投递
- *    PMHISTBEGIN:对方 / PMHISTITEM:对方:发送者:消息ID:时间戳:内容 / PMHISTEND:对方
- *    UNREAD:对方:数量,对方2:数量2                            未读汇总
- *    PUBLICCLEARED:操作者    公共记录已被管理员清空
- *    PMCLEARED:对方          自己与某人的私聊记录已清空
- *    PMFAIL:对方:原因        私聊操作失败
- *    RECALLED:消息ID:操作者          公共消息已被撤回
- *    PMRECALLED:对方:消息ID:操作者   私聊消息已被撤回
- *    RECALLFAIL:消息ID:原因         撤回被拒（超时/无权/不存在）
- *    ATMSG:发送者                   你被 @ 了（公共消息里 @ 了你的名字）
- *    SRESULTBEGIN:对方 / SRESULT:对方:消息ID:发送者:时间戳:内容 / SRESULTEND:对方
- *    SEARCHFAIL:对方:原因
+ *    LOGINOK:角色 / LOGINFAIL:原因       角色为 admin / user
+ *    MSG:昵称:消息ID:时间戳:内容           公共消息
+ *    PMMSG:对方:发送者:消息ID:时间戳:未读数:内容   私聊消息
+ *    SYSTEM:内容    系统消息（有人加入/离开/被踢等）
+ *    USERS:昵称列表 / OFFLINEUSERS:昵称列表   在线/离线用户列表
+ *    KICKED:原因 / BANNED:原因   被管理员踢出 / 封禁（随后连接被关闭）
+ *    HISTBEGIN / HISTITEM / HISTEND      公共历史回放
+ *    RECALLED:消息ID:操作者 / RECALLFAIL:消息ID:原因   撤回结果
  *
- * 协议约定：
- *  - 时间戳一律用 epoch millis（纯数字）。若用 HH:mm:ss 会引入冒号，破坏字段分隔。
- *  - 消息内容固定放在最后一个字段，前面的字段用连续 indexOf(':') 切分。用户名已由
- *    isValidName 禁止包含冒号和逗号，消息ID是 UUID（hex+连字符），时间戳和计数是纯
- *    数字，因此切分是安全的。
- *  - 消息ID（msgId）一律由服务端生成，不接受客户端指定——允许指定就能恶意复用他人
- *    消息的 ID 并借撤回删掉别人的消息，见 dbManager.savePublicMessage 的注释。
- *  - 所有内容型消息在入库和广播之前必须经过 sanitize() 清洗，见该方法的注释。
+ * 协议设计时注意的点：
+ *  - 时间戳用 epoch 毫秒（纯数字），用 HH:mm:ss 会带冒号，破坏字段分隔
+ *  - 消息内容固定放在最后一个字段，切分时用 indexOf(':') 只切前几个字段，
+ *    内容里的冒号不会被切错；用户名则干脆禁止包含冒号和逗号（isValidName）
+ *  - 消息ID由服务端生成（UUID），不接受客户端传的，防止伪造 ID 去撤别人的消息
+ *  - 所有内容型消息入库和广播前都要过 sanitize() 清洗（去换行、限长）
  */
 public class chatServer {
 
@@ -177,13 +155,13 @@ public class chatServer {
     }
 
     /**
-     * 读取数据库配置，优先级：jar 同目录的 config.properties > 工作目录的 config.properties > 默认值。
+     * 读取数据库配置：优先读 jar 同目录的 config.properties，再试工作目录，都没有就用默认值。
      *
-     * 之前只用 Paths.get("config.properties")（相对工作目录），把 jar 单独拷到别的目录
-     * 用 java -jar 启动时工作目录不是 jar 所在目录，配置读不到，服务端会因连不上 MySQL 中止。
-     * 现在优先取 jar 同目录（与启动脚本 cd 到 jar 目录的语义一致，双击 bat 或裸跑 jar 都能读到）。
-     * 文件不存在或读取失败时返回 null（继续用默认值）。
-     * 该文件包含真实密码，已被 .gitignore 排除，不会提交到仓库。
+     * 这里踩过一个坑：之前只读工作目录下的配置文件，把 jar 单独拷出来用 java -jar 启动时
+     * 工作目录变了，配置读不到，服务器直接连不上 MySQL。后来改成先找 jar 所在目录，
+     * 这样双击 bat 启动和裸跑 jar 都能读到配置。
+     * 文件不存在或读失败时返回 null（后面继续用默认值）。
+     * 这个文件里是真实的数据库密码，已在 .gitignore 里排除，不会提交到仓库。
      */
     private static Properties loadConfigFile() {
         Path cfg = null;
@@ -221,30 +199,17 @@ public class chatServer {
     }
 
     /**
-     * 清洗消息内容：限长、去首尾空白、剔除换行符。所有内容型命令（MSG / PM）
-     * 在入库和广播之前都必须过这道关。
+     * 清洗消息内容：去换行、去首尾空白、限长。所有内容型命令（MSG / PM）入库和广播前都要过这道。
      *
-     * 限长是这里的主要职责：readLine() 会无限缓冲直到遇到行结束符，手工构造的客户端
-     * 可以发一行几十兆的内容把服务端内存撑爆，而 content 列是 TEXT（上限 64KB），
-     * 超长内容写库也会失败。
+     * 去换行是必须的：协议是一行一条命令，服务端 readLine() 把 \r、\n、\r\n 都当行结束符，
+     * 内容里混进换行符就会被拆成两行，后半段被当成一条独立命令执行。实际踩到的情况是：
+     * 从 Windows 文本里复制一句话粘贴进聊天输入框再发出去，输入框只过滤 \n 不过滤 \r，
+     * 于是 "你好\r\nCLEARPUBLIC" 发到服务端变成了两条命令——MSG:你好 和 CLEARPUBLIC。
+     * 发的人恰好是管理员的话，一次粘贴就把公共聊天记录全清了。所以发送侧（chatClient.sendLine）
+     * 和接收侧（这里）各做一道清洗，两边都防。
      *
-     * 换行符的剔除在当前传输方式下是冗余的——readLine() 把 \r、\n、\r\n 都当作行
-     * 结束符，它返回的字符串里不可能含这两个字符。保留这行是防御性的：一旦以后换成
-     * 别的分帧方式（比如带长度前缀的协议），这里就是唯一的收口。
-     *
-     * 真正防住换行注入的是客户端 chatClient.sendLine 里的同名清洗，原因是那条攻击
-     * 路径出在发送侧：本协议「每行一条命令」，而 Swing 的 JTextField 只把 \n 过滤成
-     * 空格（setDocument 里设了 filterNewlines），\r 会原样留在文本里。于是从 Windows
-     * 文本（CRLF 换行）复制一段话粘进输入框再发出去，服务端 readLine 就会在 \r 处
-     * 断行，把后半段当成一条独立命令执行：
-     *
-     *     用户粘贴 "你好\r\nCLEARPUBLIC"
-     *     经 JTextField 变成 "你好\r CLEARPUBLIC"
-     *     PrintWriter 原样发出，服务端 readLine 得到两行：MSG:你好  和  CLEARPUBLIC
-     *
-     * 发送者若恰好是管理员，一次粘贴就清空了公共聊天记录；KICK、BAN、LOGOUT 同理。
-     * 注意这不是「客户端校验就够了」的反例——直接构造 socket 的攻击者本来就能发送
-     * 任意命令，无需注入，挡住他们的是各命令自身的 isAdmin() 权限校验。
+     * 限长也放在这里：readLine() 会一直缓冲到行结束，手工构造的客户端可以发一行几十兆
+     * 的内容把服务器内存撑爆，而且数据库 content 列是 TEXT（上限 64KB），超长写库也会失败。
      */
     private static String sanitize(String content) {
         String s = content.replace('\r', ' ').replace('\n', ' ').trim();
@@ -255,11 +220,9 @@ public class chatServer {
     }
 
     /**
-     * 图片消息校验：整体放行到 MAX_IMG_MSG_LEN，并验证 Base64 合法 + 图片魔数。
-     *
-     * 图片消息不能像文本那样截断——截断破坏 Base64，解码必然失败。所以这里整体
-     * 校验，任何一项不过关返回空串，调用方按「内容为空」丢弃，不留半截数据入库。
-     * 手打文本 "[IMG]hello" 也会被魔数校验挡住。
+     * 图片消息校验：图片不能像文本那样截断，截断就破坏了 Base64，解码必失败。
+     * 所以这里做整体校验：长度超限、Base64 不合法、文件头不是 JPEG/PNG（魔数）都直接拒绝，
+     * 调用方按「内容为空」丢弃，不留半截数据入库。手打一段 "[IMG]hello" 也会被魔数挡住。
      */
     private static String sanitizeImageMessage(String s) {
         if (s.length() > MAX_IMG_MSG_LEN) {
@@ -289,8 +252,9 @@ public class chatServer {
     }
 
     /**
-     * 每个客户端连接对应一个 ClientHandler 线程，
-     * 在该线程中循环读取客户端发来的每一行消息。
+     * 一个 ClientHandler 就是一个客户端的连接处理线程。
+     * 每个客户端连上来，主线程就 new 一个并 start，这个线程一直循环
+     * 读该客户端发来的每一行消息，直到对方断开。
      */
     private static class ClientHandler implements Runnable {
 
@@ -325,9 +289,9 @@ public class chatServer {
 
         /**
          * 解析并处理客户端发来的每一条消息。
-         *
-         * 除注册和登录外，所有命令都必须先确认已登录（nickname != null），
-         * 否则未登录的连接就能直接触发数据库查询。
+         * 按命令前缀分发给对应的处理方法。
+         * 注意除注册和登录外，其他命令都要先确认已登录（nickname != null），
+         * 不然没登录的连接也能触发数据库查询，肯定不行。
          */
         private void handleMessage(String line) {
             if (line.startsWith("REGISTER:")) {
@@ -382,9 +346,8 @@ public class chatServer {
         // ===== 头像 =====
 
         /**
-         * 拉取用户头像：GETAVATAR:用户名
-         * 响应 AVATAR:用户名:base64（未设置头像时 base64 为空字段）。
-         * 数据按需拉取，不进 USERS 广播，避免用户列表刷新时重复传输。
+         * 拉取用户头像：GETAVATAR:用户名，响应 AVATAR:用户名:base64（没设置头像时 base64 为空）。
+         * 头像按需拉取，不放进 USERS 用户列表广播里——不然每次刷新列表都要传所有人的头像，太浪费。
          */
         private void handleGetAvatar(String target) {
             if (!isValidName(target)) {
@@ -402,8 +365,8 @@ public class chatServer {
         }
 
         /**
-         * 上传/移除自己的头像：SETAVATAR:base64（空 = 移除）
-         * 成功回 AVATAROK 并广播 AVATARCHG:用户名（各客户端清缓存后按需重拉）；
+         * 上传/移除自己的头像：SETAVATAR:base64（空 = 移除）。
+         * 成功回 AVATAROK 并广播 AVATARCHG:用户名（其他客户端收到后清掉缓存，按需重新拉取）；
          * 失败回 AVATARFAIL:原因。
          */
         private void handleSetAvatar(String b64) {
@@ -435,7 +398,8 @@ public class chatServer {
                 sendTo(this, "AVATARFAIL:头像文件过大（上限 128KB）");
                 return;
             }
-            // 魔数校验，防止把任意二进制当头像存进库
+            // 校验文件头（魔数）：JPEG 以 FFD8FF 开头，PNG 以 89504E47 开头，
+            // 防止把任意二进制数据当头像存进数据库
             boolean jpeg = (data[0] & 0xFF) == 0xFF && (data[1] & 0xFF) == 0xD8 && (data[2] & 0xFF) == 0xFF;
             boolean png = (data[0] & 0xFF) == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47;
             if (!jpeg && !png) {
@@ -455,10 +419,9 @@ public class chatServer {
         }
 
         /**
-         * 公共聊天消息：先入库再广播。
-         *
-         * 入库失败时不广播（fail-closed），保证「历史里有的都广播过，广播过的都在历史里」
-         * 这个不变式——否则重登后会看到一份和当时界面对不上的记录。
+         * 公共聊天消息：先存数据库，成功后再广播给所有在线客户端。
+         * 入库失败就不广播。顺序不能反：如果先广播、存库却失败了，
+         * 用户重登拉历史时会发现刚才明明看到的消息不见了，两边对不上。
          */
         private void handlePublicMessage(String rest) {
             String content = sanitize(rest);
@@ -480,16 +443,15 @@ public class chatServer {
         }
 
         /**
-         * @提醒检测：扫描公共消息内容中的「@用户名」，命中在线用户则发 ATMSG。
-         *
-         * 词边界必须用 Unicode 类别（\\p{L}\\p{N}）而不是 Java 的 \\w——后者只是
-         * [a-zA-Z0-9_]，不含中文。用户名「张」和「张三」同时存在时，「@张三你好」
-         * 用 \\w 判断会误报给「张」（「三」不是 \\w，负向断言通过）。
-         *
+         * @提醒检测：扫描公共消息内容里的「@用户名」，命中的在线用户发 ATMSG 通知。
          * 同一消息 @ 同一人只提醒一次；不提醒自己；只提醒在线用户。
+         *
+         * 踩过的坑：判断词边界要用 Unicode 类别 \\p{L}\\p{N} 而不是 Java 的 \\w——
+         * \\w 只等于 [a-zA-Z0-9_]，不认中文。用户名「张」和「张三」同时存在时，
+         * 发「@张三你好」用 \\w 判断会把「@张三」当成「@张」+ 一个非词字符，误提醒给「张」。
          */
         private void notifyMentioned(String content) {
-            // 图片消息是 Base64 文本，既没有 @ 语义，扫描超大字符串 × N 用户还会卡
+            // 图片消息是 Base64 文本，没有 @ 语义，扫几兆字符串 × 所有在线用户还会卡
             if (content.startsWith(chatTheme.IMG_PREFIX)) {
                 return;
             }
@@ -577,10 +539,9 @@ public class chatServer {
         /**
          * 私聊目标合法性校验，不合法时回 PMFAIL 并返回 false。
          *
-         * 禁止给自己发私聊：双份行模型下 owner 和 peer 都会是自己，PMHIST 查询
-         * 「owner=我 AND peer=我」会让每条消息命中两行，历史里全部重复显示。
-         * 界面上右键菜单对自己不弹出（clientChatUI.showUserPopup），但手工构造
-         * PM:自己:内容 能绕过，所以服务端必须自己挡住。
+         * 不能给自己发私聊：一条私聊在数据库里存两份（自己一份、对方一份），
+         * 给自己发的话两份都是自己，拉历史时每条消息会命中两行，重复显示。
+         * 界面上右键菜单对自己不弹出，但手工构造 PM:自己:内容 能绕过，所以服务端要挡。
          */
         private boolean checkPeer(String target) {
             if (target.isEmpty() || !isValidName(target)) {
@@ -605,10 +566,9 @@ public class chatServer {
         }
 
         /**
-         * 发送私聊：PM:对方:内容
-         *
-         * 对方离线时消息仍然入库，等对方上线拉历史时能看到；这里额外给发送方回一条
-         * 系统提示，否则发送方无法区分「已实时送达」和「石沉大海」。
+         * 发送私聊：PM:对方:内容。
+         * 对方离线时消息照常入库，等对方上线拉历史时能看到；同时给发送方回一条系统提示，
+         * 不然发送方分不清消息是实时送达了还是石沉大海。
          */
         private void handlePrivateMessage(String rest) {
             int colon = rest.indexOf(':');
@@ -657,11 +617,9 @@ public class chatServer {
         }
 
         /**
-         * 拉取私聊历史：PMHIST:对方
-         *
-         * 顺序必须是「先查历史发出去，再标记已读」。若反过来先标记已读，
-         * 在 UPDATE 之后 SELECT 之前插入的新消息会被查出来显示，但它的 is_read 仍是 0，
-         * 下次登录就会出现幽灵未读。
+         * 拉取私聊历史：PMHIST:对方。
+         * 顺序必须是先发历史、再标记已读。反过来做的话，标完已读之后新来的消息
+         * 会被查出来显示，但它的已读标记还是 0，下次登录会出现"明明读过了还有红点"的怪事。
          */
         private void handlePmHistory(String target) {
             if (!checkPeer(target)) {
@@ -770,13 +728,12 @@ public class chatServer {
         // ===== 消息撤回 =====
 
         /**
-         * 撤回公共消息：RECALL:消息ID
-         *
-         * 权限：只能撤自己的；管理员可撤任何人的。时限：2 分钟内，管理员豁免。
-         * 时限用服务端时钟（send_time 由服务端写入），不信任客户端。
-         * 校验与删除都在 dbManager.recallPublic 的同一 synchronized 方法内完成，
-         * 且先校验后删除——越权/超时的撤回不会动到行。
-         * 撤回即删除——离线用户上线拉历史时自然看不到这条消息。
+         * 撤回公共消息：RECALL:消息ID。
+         * 权限：只能撤自己的，管理员可以撤任何人的；时限：2 分钟内（管理员豁免）。
+         * 时间用服务端写入的 send_time 判断，不信任客户端传的时间。
+         * 校验和删除都在 dbManager.recallPublic 的同一个 synchronized 方法里完成，
+         * 先校验后删除，越权或超时的撤回不会真的删到数据。
+         * 撤回即删除，离线用户上线拉历史时自然看不到这条消息。
          */
         private void handleRecall(String msgId) {
             if (!isValidMsgId(msgId)) {
@@ -809,12 +766,10 @@ public class chatServer {
         }
 
         /**
-         * 撤回私聊消息：PMRECALL:对方:消息ID
-         *
-         * 只能撤自己的消息（管理员在私聊里没有特权）。私聊是双份行，一次 DELETE 删双方
-         * 的份——与微信一致，对方界面和历史里这条消息都消失。
-         * 回执的 peer 字段按数据库行视角分别构造，不信任命令参数：
-         * 发给发送者时 peer=会话对方，发给接收者时 peer=发送者。
+         * 撤回私聊消息：PMRECALL:对方:消息ID。
+         * 只能撤自己的消息（管理员在私聊里没有特权）。私聊在库里是双份行，
+         * 一次 DELETE 把双方的两份一起删——和微信一致，对方那边这条消息也消失。
+         * 回执里的 peer 字段按数据库行的视角分别构造，不直接信任命令参数。
          */
         private void handlePmRecall(String rest) {
             int colon = rest.indexOf(':');
@@ -1037,7 +992,7 @@ public class chatServer {
                     sendTo(this, "LOGINFAIL:服务器人数已满（最多" + MAX_USERS + "人），请稍后再试");
                     return;
                 }
-                // putIfAbsent 原子操作：同一账号不能在多个客户端同时登录
+                // putIfAbsent：判断 + 插入一步完成（原子操作），防止同一账号在多台电脑同时登录
                 if (clients.putIfAbsent(username, this) != null) {
                     sendTo(this, "LOGINFAIL:该账号已在其他客户端登录");
                     return;
@@ -1056,8 +1011,8 @@ public class chatServer {
         }
 
         /**
-         * 客户端断开清理（幂等，重复调用安全）。
-         * 从在线表移除 -> 通知其他人 -> 关闭流和 socket
+         * 客户端断开后的统一清理：从在线表移除 -> 通知其他人 -> 关闭流和 socket。
+         * 用 nickname 判空保证幂等，断开和异常断开同时触发时不会重复广播。
          */
         private void disconnect() {
             if (nickname != null) {
@@ -1087,7 +1042,7 @@ public class chatServer {
     private static void sendTo(ClientHandler client, String message) {
         client.out.println(message);
         if (client.out.checkError()) {
-            // 写入失败说明该客户端连接已断开，清理掉（ConcurrentHashMap 遍历中删除是安全的）
+            // 写入失败说明对方连接已经断了，顺手清理掉（ConcurrentHashMap 遍历时删除是安全的）
             client.disconnect();
         }
     }
