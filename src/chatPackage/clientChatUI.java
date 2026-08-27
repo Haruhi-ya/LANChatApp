@@ -88,6 +88,23 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
     // 搜索
     private searchDialog activeSearchDialog;
 
+    // 修改密码（头像菜单入口，同时只允许一个窗口）
+    private changePasswordDialog activePwdDialog;
+
+    // ===== 好友 =====
+
+    /** 好友集合：服务端 FRIENDLIST 快照整体驱动（快照覆盖，不做增量） */
+    private final Set<String> friends = ConcurrentHashMap.newKeySet();
+
+    /** 待处理好友申请数（顶栏红点），由 FRIENDREQLIST 回放与 FRIENDREQNEW 推送驱动 */
+    private int pendingRequestCount;
+    private JButton addFriendButton;
+    private JButton friendRequestButton;
+    private JButton adminPmButton; // 功能3：管理员查看私聊按钮
+    private friendRequestsDialog activeRequestsDialog;
+    private addFriendDialog activeAddFriendDialog;
+    private adminPmDialog activeAdminPmDialog; // 功能3
+
     // 检测内容里是否 @ 了自己（Unicode 词边界：Java 的 \w 不含中文，会误报「张三」对「张」）
     private final Pattern mentionPattern;
 
@@ -162,7 +179,7 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
         JPanel leftPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
         leftPanel.setOpaque(false);
 
-        JLabel titleLabel = new JLabel("💬 聊天室");
+        JLabel titleLabel = chatTheme.createMixedTextLabel("💬 聊天室");
         titleLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 16));
         titleLabel.setForeground(chatTheme.TEXT_DARK);
         leftPanel.add(titleLabel);
@@ -176,6 +193,28 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
 
         JPanel rightPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
         rightPanel.setOpaque(false);
+
+        // 添加好友：通过用户名搜索用户并发起好友申请
+        addFriendButton = chatTheme.createStyledButton("➕ 添加好友",
+                new Color(235, 238, 245), chatTheme.TEXT_DARK, new Color(220, 224, 235));
+        addFriendButton.setPreferredSize(new Dimension(100, 32));
+        addFriendButton.addActionListener(e -> openAddFriendDialog());
+        rightPanel.add(addFriendButton);
+
+        // 好友申请：未处理申请数 > 0 时按钮文本带红点数
+        friendRequestButton = chatTheme.createStyledButton("📨 好友申请",
+                new Color(235, 238, 245), chatTheme.TEXT_DARK, new Color(220, 224, 235));
+        friendRequestButton.setPreferredSize(new Dimension(110, 32));
+        friendRequestButton.addActionListener(e -> openFriendRequestsDialog());
+        rightPanel.add(friendRequestButton);
+
+        // 管理员查看私聊：仅管理员可见，角色由服务端在 onRole 回调里下发后才显示
+        adminPmButton = chatTheme.createStyledButton("🔍 查看私聊",
+                new Color(235, 238, 245), chatTheme.TEXT_DARK, new Color(220, 224, 235));
+        adminPmButton.setPreferredSize(new Dimension(100, 32));
+        adminPmButton.setVisible(false);
+        adminPmButton.addActionListener(e -> openAdminPmDialog());
+        rightPanel.add(adminPmButton);
 
         // 清空公共记录：仅管理员可见，角色由服务端在 onRole 回调里下发后才显示
         clearPublicButton = chatTheme.createStyledButton("🗑 清空聊天记录",
@@ -295,11 +334,21 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
             public void mouseReleased(MouseEvent e) { showUserPopup(e); }
             @Override
             public void mouseClicked(MouseEvent e) {
-                // 双击直接开私聊：看到未读红点的人第一反应就是双击
+                // 双击直接开私聊（好友）；非好友双击 = 发送好友申请（分组头行忽略）
                 if (e.getClickCount() == 2 && SwingUtilities.isLeftMouseButton(e)) {
                     UserEntry entry = entryAt(e.getPoint());
-                    if (entry != null && !entry.name.equals(nickname)) {
+                    if (entry == null || entry.header || entry.name.equals(nickname)) {
+                        return;
+                    }
+                    if (entry.friend) {
                         openPrivateChat(entry.name);
+                    } else {
+                        int ok = JOptionPane.showConfirmDialog(clientChatUI.this,
+                                "「" + entry.name + "」还不是你的好友，是否发送好友申请？",
+                                "添加好友", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+                        if (ok == JOptionPane.YES_OPTION) {
+                            client.sendFriendRequest(entry.name);
+                        }
                     }
                 }
             }
@@ -351,6 +400,14 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
 
     // ===== 头像与图片发送 =====
 
+    /** 打开修改密码弹窗（同时只允许一个，已有窗口则前置） */
+    private void openChangePasswordDialog() {
+        if (activePwdDialog == null || !activePwdDialog.isDisplayable()) {
+            activePwdDialog = new changePasswordDialog(this, client);
+        }
+        activePwdDialog.toFront();
+    }
+
     private void showAvatarMenu() {
         JPopupMenu menu = new JPopupMenu();
         JMenuItem changeItem = new JMenuItem("更换头像");
@@ -359,6 +416,10 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
         JMenuItem removeItem = new JMenuItem("移除头像");
         removeItem.addActionListener(e -> client.setAvatar(""));
         menu.add(removeItem);
+        menu.addSeparator();
+        JMenuItem changePwdItem = new JMenuItem("修改密码");
+        changePwdItem.addActionListener(e -> openChangePasswordDialog());
+        menu.add(changePwdItem);
         menu.show(selfAvatarLabel, 0, selfAvatarLabel.getHeight());
     }
 
@@ -408,6 +469,10 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
         recalledDuringLoad.clear();
         client.requestPublicHistory();
         client.requestUnread();
+        // 登录后主动补拉好友数据（幂等快照覆盖）：好友列表 + 离线期间收到的好友申请。
+        // 不做 volatile 缓存——登录后快照由这里拉取，在线变更由服务端事件驱动推送，两条路都可靠。
+        client.requestFriendList();
+        client.requestFriendRequests();
 
         historyTimeout = new Timer(HISTORY_TIMEOUT_MS, e -> {
             if (!historyLoaded) {
@@ -522,6 +587,84 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
         }
     }
 
+    // ===== 好友 =====
+
+    /** 顶栏好友申请按钮红点：有未处理申请时文本带数量 */
+    private void updateRequestBadge() {
+        if (friendRequestButton != null) {
+            friendRequestButton.setText(pendingRequestCount > 0
+                    ? "📨 好友申请(" + pendingRequestCount + ")" : "📨 好友申请");
+        }
+    }
+
+    /** 供 addFriendDialog 等子窗口读取当前好友集合（只读访问，快照由 onFriendList 驱动） */
+    Set<String> getFriends() {
+        return friends;
+    }
+
+    private void openAddFriendDialog() {
+        if (activeAddFriendDialog == null || !activeAddFriendDialog.isDisplayable()) {
+            activeAddFriendDialog = new addFriendDialog(this, client);
+        }
+        activeAddFriendDialog.toFront();
+    }
+
+    private void openFriendRequestsDialog() {
+        if (activeRequestsDialog == null || !activeRequestsDialog.isDisplayable()) {
+            activeRequestsDialog = new friendRequestsDialog(this, client);
+        }
+        activeRequestsDialog.toFront();
+        activeRequestsDialog.refresh(); // 每次打开都拉最新申请列表
+    }
+
+    // ===== 管理员查看私聊 =====
+
+    private void openAdminPmDialog() {
+        if (activeAdminPmDialog == null || !activeAdminPmDialog.isDisplayable()) {
+            activeAdminPmDialog = new adminPmDialog(this, client);
+        }
+        activeAdminPmDialog.toFront();
+    }
+
+    @Override
+    public void onAdminPmHistoryBegin() {
+        SwingUtilities.invokeLater(() -> {
+            if (activeAdminPmDialog != null && activeAdminPmDialog.isDisplayable()) {
+                activeAdminPmDialog.onHistoryBegin();
+            }
+        });
+    }
+
+    @Override
+    public void onAdminPmHistoryItem(long timestamp, String sender, String content) {
+        SwingUtilities.invokeLater(() -> {
+            if (activeAdminPmDialog != null && activeAdminPmDialog.isDisplayable()) {
+                activeAdminPmDialog.onHistoryItem(timestamp, sender, content);
+            }
+        });
+    }
+
+    @Override
+    public void onAdminPmHistoryEnd() {
+        SwingUtilities.invokeLater(() -> {
+            if (activeAdminPmDialog != null && activeAdminPmDialog.isDisplayable()) {
+                activeAdminPmDialog.onHistoryEnd();
+            }
+        });
+    }
+
+    @Override
+    public void onAdminPmFail(String reason) {
+        SwingUtilities.invokeLater(() -> {
+            if (activeAdminPmDialog != null && activeAdminPmDialog.isDisplayable()) {
+                activeAdminPmDialog.onFail(reason);
+            } else {
+                JOptionPane.showMessageDialog(this, reason, "查看私聊记录",
+                        JOptionPane.WARNING_MESSAGE);
+            }
+        });
+    }
+
     // ===== 用户列表 =====
 
     private UserEntry entryAt(Point p) {
@@ -538,22 +681,39 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
         return userListModel.get(index);
     }
 
-    /** 用户列表右键菜单：所有人都能发私聊，踢出/封禁仅管理员可见 */
+    /** 用户列表右键菜单：好友可私聊/删除好友，非好友只能发申请；踢出/封禁仅管理员可见 */
     private void showUserPopup(MouseEvent e) {
         if (!e.isPopupTrigger()) {
             return;
         }
         UserEntry entry = entryAt(e.getPoint());
-        if (entry == null || entry.name.equals(nickname)) {
+        if (entry == null || entry.header || entry.name.equals(nickname)) {
             return;
         }
         userList.setSelectedValue(entry, false);
 
         JPopupMenu menu = new JPopupMenu();
 
-        JMenuItem pmItem = new JMenuItem("发送私聊");
-        pmItem.addActionListener(ev -> openPrivateChat(entry.name));
-        menu.add(pmItem);
+        if (entry.friend) {
+            JMenuItem pmItem = new JMenuItem("发送私聊");
+            pmItem.addActionListener(ev -> openPrivateChat(entry.name));
+            menu.add(pmItem);
+
+            JMenuItem delItem = new JMenuItem("删除好友");
+            delItem.addActionListener(ev -> {
+                int ok = JOptionPane.showConfirmDialog(this,
+                        "确定要删除好友「" + entry.name + "」吗？\n删除后你们将无法再私聊。",
+                        "删除好友", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+                if (ok == JOptionPane.YES_OPTION) {
+                    client.removeFriend(entry.name);
+                }
+            });
+            menu.add(delItem);
+        } else {
+            JMenuItem addItem = new JMenuItem("发送好友申请");
+            addItem.addActionListener(ev -> client.sendFriendRequest(entry.name));
+            menu.add(addItem);
+        }
 
         if ("admin".equals(role)) {
             menu.addSeparator();
@@ -577,28 +737,61 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
         menu.show(userList, e.getX(), e.getY());
     }
 
+    /** 重建用户列表：分为「我的好友」和「其他用户」两组，各组内在线在前、离线在后 */
     private void refreshUserList() {
         userListModel.clear();
-        for (String user : onlineUsers) {
-            userListModel.addElement(new UserEntry(user, true));
+        List<String> friendOnline = new ArrayList<>(), friendOffline = new ArrayList<>();
+        List<String> otherOnline = new ArrayList<>(), otherOffline = new ArrayList<>();
+        // 自己不出现在右侧栏（顶栏已有自己的头像和昵称），跳过 nickname
+        for (String u : onlineUsers) {
+            if (u.equals(nickname)) {
+                continue;
+            }
+            (friends.contains(u) ? friendOnline : otherOnline).add(u);
         }
-        for (String user : offlineUsers) {
-            userListModel.addElement(new UserEntry(user, false));
+        for (String u : offlineUsers) {
+            if (u.equals(nickname)) {
+                continue;
+            }
+            (friends.contains(u) ? friendOffline : otherOffline).add(u);
         }
-        userCountLabel.setText(onlineUsers.size() + "人在线 · 共"
-                + (onlineUsers.size() + offlineUsers.size()) + "人");
+        userListModel.addElement(new UserEntry("★ 我的好友"));
+        for (String u : friendOnline) userListModel.addElement(new UserEntry(u, true, true));
+        for (String u : friendOffline) userListModel.addElement(new UserEntry(u, false, true));
+        userListModel.addElement(new UserEntry("其他用户"));
+        for (String u : otherOnline) userListModel.addElement(new UserEntry(u, true, false));
+        for (String u : otherOffline) userListModel.addElement(new UserEntry(u, false, false));
+        // 计数与列表保持一致：统计的也是过滤掉自己之后的其他人
+        int onlineCount = friendOnline.size() + otherOnline.size();
+        int totalCount = onlineCount + friendOffline.size() + otherOffline.size();
+        userCountLabel.setText(onlineCount + "人在线 · 共" + totalCount + "人");
         for (Map.Entry<String, privateChatUI> e : privateWindows.entrySet()) {
             e.getValue().setPeerOnline(onlineUsers.contains(e.getKey()));
         }
     }
 
+    /** 用户列表条目：普通用户行 / 分组头行（不可交互） */
     private static class UserEntry {
         final String name;
         final boolean online;
+        final boolean friend;   // 是否好友（决定双击行为与分组归属）
+        final boolean header;   // 分组头行
+        final String headerText;
 
-        UserEntry(String name, boolean online) {
+        UserEntry(String name, boolean online, boolean friend) {
             this.name = name;
             this.online = online;
+            this.friend = friend;
+            this.header = false;
+            this.headerText = null;
+        }
+
+        UserEntry(String headerText) { // 分组头行
+            this.name = "";
+            this.online = false;
+            this.friend = false;
+            this.header = true;
+            this.headerText = headerText;
         }
     }
 
@@ -663,22 +856,41 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
         @Override
         public Component getListCellRendererComponent(JList<? extends UserEntry> list, UserEntry value,
                                                       int index, boolean isSelected, boolean cellHasFocus) {
-            if (value != null) {
-                avatarLabel.setUsername(value.name);
-                nameLabel.setText(value.name);
-                statusLabel.setForeground(value.online ? chatTheme.ONLINE_GREEN : chatTheme.OFFLINE_GRAY);
-                nameLabel.setForeground(value.online ? chatTheme.TEXT_DARK : chatTheme.OFFLINE_TEXT);
+            if (value == null) {
+                setBackground(chatTheme.SIDEBAR_BG);
+                return this;
+            }
+            if (value.header) {
+                // 分组头行：居中灰色小字，不显示头像/状态点/未读徽标，不可选中外观
+                // （空用户名会被头像绘制兜底画成 "?"，直接隐藏组件）
+                avatarLabel.setVisible(false);
+                avatarLabel.setUsername("");
+                nameLabel.setText(value.headerText);
+                nameLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 12));
+                nameLabel.setForeground(chatTheme.TEXT_GRAY);
+                statusLabel.setVisible(false);
+                badge.setVisible(false);
+                setBackground(chatTheme.SIDEBAR_BG);
+                return this;
+            }
+            // 普通用户行
+            avatarLabel.setVisible(true);
+            nameLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
+            avatarLabel.setUsername(value.name);
+            nameLabel.setText(value.name);
+            statusLabel.setVisible(true);
+            statusLabel.setForeground(value.online ? chatTheme.ONLINE_GREEN : chatTheme.OFFLINE_GRAY);
+            nameLabel.setForeground(value.online ? chatTheme.TEXT_DARK : chatTheme.OFFLINE_TEXT);
 
-                Integer unread = unreadCounts.get(value.name);
-                if (unread != null && unread > 0) {
-                    String text = unread > 99 ? "99+" : String.valueOf(unread);
-                    badge.setText(text);
-                    int width = Math.max(18, 10 + text.length() * 7);
-                    badge.setPreferredSize(new Dimension(width, 16));
-                    badge.setVisible(true);
-                } else {
-                    badge.setVisible(false);
-                }
+            Integer unread = unreadCounts.get(value.name);
+            if (unread != null && unread > 0) {
+                String text = unread > 99 ? "99+" : String.valueOf(unread);
+                badge.setText(text);
+                int width = Math.max(18, 10 + text.length() * 7);
+                badge.setPreferredSize(new Dimension(width, 16));
+                badge.setVisible(true);
+            } else {
+                badge.setVisible(false);
             }
             setBackground(isSelected ? new Color(235, 238, 250) : chatTheme.SIDEBAR_BG);
             return this;
@@ -757,8 +969,12 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
         this.role = role;
         // setListener 会补发缓存的角色，回调可能先于 UI 构造完成到达（本类构造器还没返回）
         SwingUtilities.invokeLater(() -> {
+            boolean isAdmin = "admin".equals(role);
             if (clearPublicButton != null) {
-                clearPublicButton.setVisible("admin".equals(role));
+                clearPublicButton.setVisible(isAdmin);
+            }
+            if (adminPmButton != null) {
+                adminPmButton.setVisible(isAdmin);
             }
         });
     }
@@ -1079,6 +1295,180 @@ public class clientChatUI extends JFrame implements chatClient.Listener, bubbleC
                         JOptionPane.INFORMATION_MESSAGE);
             } else {
                 JOptionPane.showMessageDialog(this, "更换头像失败：" + reason, "更换头像",
+                        JOptionPane.WARNING_MESSAGE);
+            }
+        });
+    }
+
+    @Override
+    public void onPasswordChanged(boolean success, String reason) {
+        SwingUtilities.invokeLater(() -> {
+            if (activePwdDialog != null && activePwdDialog.isDisplayable()) {
+                activePwdDialog.onResult(success, reason);
+            } else if (success) {
+                // 对话框已被用户提前关闭（改密请求发出后关窗的竞态）：
+                // 成功结果无处可回，弹全局提示，避免密码已改却毫无反馈
+                JOptionPane.showMessageDialog(this, "密码修改成功，下次登录请使用新密码",
+                        "修改密码", JOptionPane.INFORMATION_MESSAGE);
+            }
+        });
+    }
+
+    // ===== 好友回调 =====
+
+    @Override
+    public void onFriendList(String[] friends) {
+        SwingUtilities.invokeLater(() -> {
+            this.friends.clear();
+            Collections.addAll(this.friends, friends);
+            // 补发快照可能早于 UI 构造完成到达（与 onUserList 同款防御）
+            if (userList != null) {
+                refreshUserList();
+            }
+        });
+    }
+
+    @Override
+    public void onFriendRequestNew(String from) {
+        SwingUtilities.invokeLater(() -> {
+            pendingRequestCount++;
+            updateRequestBadge();
+            chatList.addSystem("🔔 用户「" + from + "」向你发送了好友申请", false);
+            if (activeRequestsDialog != null && activeRequestsDialog.isDisplayable()) {
+                activeRequestsDialog.refresh(); // 列表回放与推送可能交错，刷新重拉
+            }
+        });
+    }
+
+    @Override
+    public void onFriendRequestsBegin() {
+        SwingUtilities.invokeLater(() -> {
+            // 回放是查库快照：以回放为准清零重数（离线期间收到的申请由这里进红点）
+            pendingRequestCount = 0;
+            if (activeRequestsDialog != null && activeRequestsDialog.isDisplayable()) {
+                activeRequestsDialog.onRequestsBegin();
+            }
+        });
+    }
+
+    @Override
+    public void onFriendRequestsItem(String from) {
+        SwingUtilities.invokeLater(() -> {
+            pendingRequestCount++;
+            if (activeRequestsDialog != null && activeRequestsDialog.isDisplayable()) {
+                activeRequestsDialog.onRequestsItem(from);
+            }
+        });
+    }
+
+    @Override
+    public void onFriendRequestsEnd() {
+        SwingUtilities.invokeLater(() -> {
+            updateRequestBadge();
+            if (activeRequestsDialog != null && activeRequestsDialog.isDisplayable()) {
+                activeRequestsDialog.onRequestsEnd();
+            }
+        });
+    }
+
+    @Override
+    public void onFriendRequestOk(String target) {
+        SwingUtilities.invokeLater(() -> {
+            if (activeAddFriendDialog != null && activeAddFriendDialog.isDisplayable()) {
+                activeAddFriendDialog.onRequestSent(target);
+            } else {
+                chatList.addSystem("已向「" + target + "」发送好友申请，等待对方同意", false);
+            }
+        });
+    }
+
+    @Override
+    public void onFriendRequestFail(String peer, String reason) {
+        SwingUtilities.invokeLater(() -> {
+            if (activeAddFriendDialog != null && activeAddFriendDialog.isDisplayable()) {
+                activeAddFriendDialog.onRequestFail(reason);
+            } else {
+                JOptionPane.showMessageDialog(this, reason, "好友操作失败",
+                        JOptionPane.WARNING_MESSAGE);
+            }
+        });
+    }
+
+    @Override
+    public void onFriendRequestAck(String who) {
+        SwingUtilities.invokeLater(() ->
+                chatList.addSystem("🎉 你和「" + who + "」已成为好友，可以私聊了", false));
+    }
+
+    @Override
+    public void onFriendRequestDenied(String who) {
+        SwingUtilities.invokeLater(() ->
+                chatList.addSystem("「" + who + "」拒绝了你的好友申请", false));
+    }
+
+    @Override
+    public void onFriendDeleted(String who) {
+        SwingUtilities.invokeLater(() -> {
+            friends.remove(who);
+            refreshUserList();
+            chatList.addSystem("「" + who + "」已将你删除好友", false);
+            // 对方已不是好友：关掉对应的私聊窗口（服务端已拒绝新的私聊）
+            privateChatUI w = privateWindows.remove(who);
+            if (w != null) {
+                w.dispose();
+            }
+        });
+    }
+
+    @Override
+    public void onFriendDeleteResult(boolean success, String peer, String reason) {
+        SwingUtilities.invokeLater(() -> {
+            if (success) {
+                chatList.addSystem("已删除好友「" + peer + "」", false);
+                if (privateWindows.containsKey(peer)) { // 自己删的，同样关窗
+                    privateWindows.remove(peer).dispose();
+                }
+            } else {
+                JOptionPane.showMessageDialog(this, reason, "删除好友失败",
+                        JOptionPane.WARNING_MESSAGE);
+            }
+        });
+    }
+
+    @Override
+    public void onUserSearchBegin() {
+        SwingUtilities.invokeLater(() -> {
+            if (activeAddFriendDialog != null && activeAddFriendDialog.isDisplayable()) {
+                activeAddFriendDialog.onSearchBegin();
+            }
+        });
+    }
+
+    @Override
+    public void onUserSearchItem(String username) {
+        SwingUtilities.invokeLater(() -> {
+            if (activeAddFriendDialog != null && activeAddFriendDialog.isDisplayable()) {
+                activeAddFriendDialog.onSearchItem(username);
+            }
+        });
+    }
+
+    @Override
+    public void onUserSearchEnd() {
+        SwingUtilities.invokeLater(() -> {
+            if (activeAddFriendDialog != null && activeAddFriendDialog.isDisplayable()) {
+                activeAddFriendDialog.onSearchEnd();
+            }
+        });
+    }
+
+    @Override
+    public void onUserSearchFail(String reason) {
+        SwingUtilities.invokeLater(() -> {
+            if (activeAddFriendDialog != null && activeAddFriendDialog.isDisplayable()) {
+                activeAddFriendDialog.onSearchFail(reason);
+            } else {
+                JOptionPane.showMessageDialog(this, reason, "搜索用户失败",
                         JOptionPane.WARNING_MESSAGE);
             }
         });

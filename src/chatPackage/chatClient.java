@@ -118,6 +118,59 @@ public class chatClient {
 
         /** SETAVATAR 结果：上传成功 / 失败原因 */
         default void onAvatarResult(boolean success, String reason) {}
+
+        // ===== 修改密码 =====
+
+        /** CHANGEPW 结果：成功 / 失败原因 */
+        default void onPasswordChanged(boolean success, String reason) {}
+
+        // ===== 用户搜索（添加好友） =====
+
+        default void onUserSearchBegin() {}
+        default void onUserSearchItem(String username) {}
+        default void onUserSearchEnd() {}
+        default void onUserSearchFail(String reason) {}
+
+        // ===== 好友 =====
+
+        /** 好友列表快照（登录拉取 / 关系变更后服务端推送，直接整体替换本地好友集合） */
+        default void onFriendList(String[] friends) {}
+
+        /** 收到一条新的好友申请（from 是申请人） */
+        default void onFriendRequestNew(String from) {}
+
+        /** 好友申请已发送成功（target 是接收方） */
+        default void onFriendRequestOk(String target) {}
+
+        /** 好友操作失败（发申请/接受/拒绝），peer 为目标用户 */
+        default void onFriendRequestFail(String peer, String reason) {}
+
+        /** 与 who 成为好友（自己同意的申请 / 自己的申请被同意，双向语义） */
+        default void onFriendRequestAck(String who) {}
+
+        /** 申请被 who 拒绝（仅提示，可重新申请） */
+        default void onFriendRequestDenied(String who) {}
+
+        // ===== 申请列表回放 =====
+
+        default void onFriendRequestsBegin() {}
+        default void onFriendRequestsItem(String from) {}
+        default void onFriendRequestsEnd() {}
+
+        // ===== 删除好友 =====
+
+        /** 对方 who 删除了你（在线推送，客户端关窗提示） */
+        default void onFriendDeleted(String who) {}
+
+        /** 删除好友结果：success / 对方用户名 / 失败原因 */
+        default void onFriendDeleteResult(boolean success, String peer, String reason) {}
+
+        // ===== 管理员查看私聊 =====
+
+        default void onAdminPmHistoryBegin() {}
+        default void onAdminPmHistoryItem(long timestamp, String sender, String content) {}
+        default void onAdminPmHistoryEnd() {}
+        default void onAdminPmFail(String reason) {}
     }
 
     /** 连接超时时间（毫秒），局域网连接不上时避免长时间卡住 */
@@ -260,6 +313,55 @@ public class chatClient {
     /** 上传自己的头像（base64 为空字符串 = 移除头像），结果通过 onAvatarResult 回调 */
     public void setAvatar(String base64) {
         sendLine("SETAVATAR:" + base64);
+    }
+
+    /** 修改密码，结果通过 onPasswordChanged 回调通知（成功 / 失败原因） */
+    public void changePassword(String oldPass, String newPass) {
+        sendLine("CHANGEPW:" + oldPass + ":" + newPass);
+    }
+
+    // ===== 好友 =====
+
+    /** 按用户名搜索用户（排除自己），结果通过 onUserSearchBegin/Item/End/Fail 回调 */
+    public void searchUsers(String keyword) {
+        sendLine("SEARCHUSER:" + keyword);
+    }
+
+    /** 发送好友申请，结果通过 onFriendRequestOk / onFriendRequestFail 回调 */
+    public void sendFriendRequest(String target) {
+        sendLine("FRIENDREQ:" + target);
+    }
+
+    /** 拉取自己的待处理申请列表，结果通过 onFriendRequestsBegin/Item/End 回调 */
+    public void requestFriendRequests() {
+        sendLine("FRIENDREQLIST");
+    }
+
+    /** 同意某人的好友申请 */
+    public void acceptFriendRequest(String from) {
+        sendLine("FRIENDACCEPT:" + from);
+    }
+
+    /** 拒绝某人的好友申请 */
+    public void rejectFriendRequest(String from) {
+        sendLine("FRIENDREJECT:" + from);
+    }
+
+    /** 拉取好友列表快照，结果通过 onFriendList 回调 */
+    public void requestFriendList() {
+        sendLine("FRIENDLIST");
+    }
+
+    /** 删除好友，结果通过 onFriendDeleteResult 回调 */
+    public void removeFriend(String peer) {
+        sendLine("FRIENDDEL:" + peer);
+    }
+
+    // ===== 管理员查看私聊 =====
+
+    /** 管理员：查询两个用户之间的私聊记录（双向合并），结果通过 onAdminPmHistory* 回调 */
+    public void requestAdminPmHistory(String u1, String u2) {
+        sendLine("ADMINPMHIST:" + u1 + ":" + u2);
     }
 
     /** 主动退出：发送 LOGOUT 并关闭连接 */
@@ -497,6 +599,61 @@ public class chatClient {
             listener.onAvatarResult(true, "");
         } else if (line.startsWith("AVATARFAIL:")) {
             listener.onAvatarResult(false, line.substring("AVATARFAIL:".length()));
+        } else if (line.equals("CHANGEPWOK")) {
+            listener.onPasswordChanged(true, "");
+        } else if (line.startsWith("CHANGEPWFAIL:")) {
+            listener.onPasswordChanged(false, line.substring("CHANGEPWFAIL:".length()));
+        } else if (line.startsWith("USERSEARCHBEGIN")) {
+            listener.onUserSearchBegin();
+        } else if (line.startsWith("USERSEARCHITEM:")) {
+            listener.onUserSearchItem(line.substring("USERSEARCHITEM:".length()));
+        } else if (line.startsWith("USERSEARCHEND")) {
+            listener.onUserSearchEnd();
+        } else if (line.startsWith("USERSEARCHFAIL:")) {
+            listener.onUserSearchFail(line.substring("USERSEARCHFAIL:".length()));
+        } else if (line.startsWith("FRIENDREQLISTBEGIN")) {
+            listener.onFriendRequestsBegin();
+        } else if (line.startsWith("FRIENDREQLISTITEM:")) {
+            listener.onFriendRequestsItem(line.substring("FRIENDREQLISTITEM:".length()));
+        } else if (line.startsWith("FRIENDREQLISTEND")) {
+            listener.onFriendRequestsEnd();
+        } else if (line.startsWith("FRIENDLIST:")) {
+            // FRIENDLIST:u1,u2,...（空列表为 FRIENDLIST:，与 USERS 同款解析）
+            String list = line.substring("FRIENDLIST:".length());
+            String[] friends = list.isEmpty() ? new String[0] : list.split(",");
+            listener.onFriendList(friends);
+        } else if (line.startsWith("FRIENDREQNEW:")) {
+            listener.onFriendRequestNew(line.substring("FRIENDREQNEW:".length()));
+        } else if (line.startsWith("FRIENDREQACK:")) {
+            listener.onFriendRequestAck(line.substring("FRIENDREQACK:".length()));
+        } else if (line.startsWith("FRIENDREQDENIED:")) {
+            listener.onFriendRequestDenied(line.substring("FRIENDREQDENIED:".length()));
+        } else if (line.startsWith("FRIENDREQOK:")) {
+            listener.onFriendRequestOk(line.substring("FRIENDREQOK:".length()));
+        } else if (line.startsWith("FRIENDREQFAIL:")) {
+            // FRIENDREQFAIL:对方:原因
+            String[] p = splitFixed(line.substring("FRIENDREQFAIL:".length()), 1);
+            if (p != null) {
+                listener.onFriendRequestFail(p[0], p[1]);
+            }
+        } else if (line.startsWith("FRIENDDELETED:")) {
+            listener.onFriendDeleted(line.substring("FRIENDDELETED:".length()));
+        } else if (line.startsWith("FRIENDDELOK:")) {
+            listener.onFriendDeleteResult(true, line.substring("FRIENDDELOK:".length()), "");
+        } else if (line.startsWith("FRIENDDELFAIL:")) {
+            listener.onFriendDeleteResult(false, "", line.substring("FRIENDDELFAIL:".length()));
+        } else if (line.startsWith("ADMINPMHISTBEGIN")) {
+            listener.onAdminPmHistoryBegin();
+        } else if (line.startsWith("ADMINPMHISTITEM:")) {
+            // ADMINPMHISTITEM:时间戳:发送者:内容（内容可含冒号）
+            String[] p = splitFixed(line.substring("ADMINPMHISTITEM:".length()), 2);
+            if (p != null) {
+                listener.onAdminPmHistoryItem(parseLong(p[0], 0L), p[1], p[2]);
+            }
+        } else if (line.startsWith("ADMINPMHISTEND")) {
+            listener.onAdminPmHistoryEnd();
+        } else if (line.startsWith("ADMINPMFAIL:")) {
+            listener.onAdminPmFail(line.substring("ADMINPMFAIL:".length()));
         }
     }
 

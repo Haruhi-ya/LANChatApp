@@ -341,7 +341,8 @@ public class privateChatUI extends JFrame implements bubbleChatList.MenuHandler 
 
     /** 对方账号已注销（被封禁）：禁用输入，窗口保留供查看 */
     public void markPeerGone(String reason) {
-        statusLabel.setText("○ 已注销");
+        // 好友关系破裂（被删好友）与账号注销是两种状态，区分显示；输入框都禁用
+        statusLabel.setText(reason.contains("还不是好友") ? "○ 已不是好友" : "○ 已注销");
         statusLabel.setForeground(chatTheme.DANGER);
         inputField.setEnabled(false);
         chatList.addSystem(reason, false);

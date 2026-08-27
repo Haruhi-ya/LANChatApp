@@ -79,8 +79,8 @@ public class chatEntryUI extends JFrame {
 
         GridBagConstraints gbc = new GridBagConstraints();
 
-        JLabel titleLabel = new JLabel("👋 欢迎进入聊天室");
-        titleLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 22));
+        JLabel titleLabel = chatTheme.createMixedTextLabel("欢迎进入聊天室");
+        titleLabel.setFont(new Font("Microsoft YaHei", Font.BOLD, 23));
         titleLabel.setForeground(TEXT_DARK);
         titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
         gbc.gridx = 0;

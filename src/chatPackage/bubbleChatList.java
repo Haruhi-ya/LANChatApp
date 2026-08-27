@@ -484,10 +484,13 @@ public class bubbleChatList extends JPanel {
                         from = end;
                     }
                 }
+                // 微软雅黑缺 emoji 字形（渲染成方框），emoji 段换成 emoji 字体
+                chatTheme.applyEmojiFontRanges(as, rowItem.msg.content, getFont().getSize());
                 return layoutText(rowItem.msg.content, textWidth, getFont(), as);
             } else {
                 AttributedString as = new AttributedString(rowItem.system.text);
                 as.addAttribute(TextAttribute.FONT, getFont());
+                chatTheme.applyEmojiFontRanges(as, rowItem.system.text, getFont().getSize());
                 return layoutText(rowItem.system.text, Math.max(40, width - 40), getFont(), as);
             }
         }

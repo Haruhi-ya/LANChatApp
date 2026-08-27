@@ -10,6 +10,7 @@ import javax.sound.sampled.LineUnavailableException;
 import java.awt.*;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.font.TextAttribute;
 import java.awt.geom.Ellipse2D;
 import java.awt.geom.RoundRectangle2D;
 import java.awt.image.BufferedImage;
@@ -18,10 +19,13 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.text.AttributedString;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Date;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -124,15 +128,132 @@ public final class chatTheme {
     /**
      * 纯 emoji 按钮用的字体。
      * 只用于不含中文的按钮——emoji 专用字体没有中文字形，拿去渲染中文会显示成方块。
+     * 结果按字号缓存：绘制路径会频繁调用，每次枚举系统字体名是浪费。
      */
+    private static final ConcurrentHashMap<Integer, Font> EMOJI_FONT_CACHE = new ConcurrentHashMap<>();
+
     public static Font getEmojiFont(int size) {
-        String[] candidates = {"Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji"};
-        for (String name : candidates) {
-            if (isFontAvailable(name)) {
-                return new Font(name, Font.PLAIN, size);
+        return EMOJI_FONT_CACHE.computeIfAbsent(size, s -> {
+            String[] candidates = {"Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji"};
+            for (String name : candidates) {
+                if (isFontAvailable(name)) {
+                    return new Font(name, Font.PLAIN, s);
+                }
             }
+            return new Font("Dialog", Font.PLAIN, s);
+        });
+    }
+
+    // ===== emoji 混合字体渲染 =====
+
+    /**
+     * 判断单个码点是否应交给 emoji 字体渲染。
+     *
+     * 根因：微软雅黑没有 emoji 字形，Swing 又不会自动回退字体，直接画会显示成方框 []
+     *（按钮、标题、聊天消息里的 emoji 全是这个症状）。这里把 emoji 码点挑出来，
+     * 混排时用 Segoe UI Emoji 渲染。★☆ 雅黑自带字形，特意排除，避免无谓换字体。
+     */
+    public static boolean isEmojiCodePoint(int cp) {
+        if (cp >= 0x1F000) {
+            return true; // 补充平面：绝大多数是 emoji（表情、符号、🗑🔒 等）
         }
-        return new Font("Dialog", Font.PLAIN, size);
+        if (cp == 0xFE0F) {
+            return true; // variation selector（⚠️❤️ 等），跟随前面的 emoji
+        }
+        // BMP 内的符号类 emoji；2605/2606（★☆）雅黑有字形，不走 emoji 字体
+        return (cp >= 0x2600 && cp <= 0x27BF) && cp != 0x2605 && cp != 0x2606;
+    }
+
+    /** 文本中是否含有需要 emoji 字体渲染的字符 */
+    public static boolean containsEmoji(String text) {
+        if (text == null || text.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < text.length(); ) {
+            int cp = text.codePointAt(i);
+            if (isEmojiCodePoint(cp)) {
+                return true;
+            }
+            i += Character.charCount(cp);
+        }
+        return false;
+    }
+
+    /**
+     * 在区域内水平居中绘制「emoji + 中文」混合文本：按字符切段（连续的同类字符为一段），
+     * emoji 段用 emoji 字体、普通段用 normalFont，共用一个基线。所有段用各自的
+     * ascent/descent 求最大值做垂直居中，避免行内文字上下漂移。
+     */
+    public static void paintMixedText(Graphics2D g2, String text, Font normalFont, Font emojiFont,
+                                      Color color, int centerX, int centerY) {
+        if (text.isEmpty()) {
+            return;
+        }
+        // 按字符切段
+        List<String> segments = new ArrayList<>();
+        List<Boolean> emojiSegs = new ArrayList<>();
+        StringBuilder buf = new StringBuilder();
+        boolean currentEmoji = isEmojiCodePoint(text.codePointAt(0));
+        for (int i = 0; i < text.length(); ) {
+            int cp = text.codePointAt(i);
+            boolean isEmoji = isEmojiCodePoint(cp);
+            if (isEmoji != currentEmoji) {
+                segments.add(buf.toString());
+                emojiSegs.add(currentEmoji);
+                buf.setLength(0);
+                currentEmoji = isEmoji;
+            }
+            buf.appendCodePoint(cp);
+            i += Character.charCount(cp);
+        }
+        if (buf.length() > 0) {
+            segments.add(buf.toString());
+            emojiSegs.add(currentEmoji);
+        }
+        // 度量：总宽 + 公共基线（取各段字形最高的 ascent/descent）
+        g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
+                RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+        List<FontMetrics> metrics = new ArrayList<>();
+        int totalWidth = 0, maxAscent = 0, maxDescent = 0;
+        for (int i = 0; i < segments.size(); i++) {
+            FontMetrics fm = g2.getFontMetrics(emojiSegs.get(i) ? emojiFont : normalFont);
+            metrics.add(fm);
+            totalWidth += fm.stringWidth(segments.get(i));
+            maxAscent = Math.max(maxAscent, fm.getAscent());
+            maxDescent = Math.max(maxDescent, fm.getDescent());
+        }
+        int baseline = centerY + (maxAscent - maxDescent) / 2;
+        int x = centerX - totalWidth / 2;
+        for (int i = 0; i < segments.size(); i++) {
+            g2.setFont(emojiSegs.get(i) ? emojiFont : normalFont);
+            g2.setColor(color);
+            g2.drawString(segments.get(i), x, baseline);
+            x += metrics.get(i).stringWidth(segments.get(i));
+        }
+    }
+
+    /**
+     * 给 AttributedString 中所有 emoji 字符段覆盖 emoji 字体（供 TextLayout 渲染路径用，
+     * 如聊天气泡）。调用前需先对整个文本设置过普通字体（FONT 属性），
+     * 这里只在 emoji 段的范围内覆盖。
+     */
+    public static void applyEmojiFontRanges(AttributedString as, String text, int size) {
+        Font emojiFont = getEmojiFont(size);
+        int from = -1;
+        for (int i = 0; i < text.length(); ) {
+            int cp = text.codePointAt(i);
+            boolean isEmoji = isEmojiCodePoint(cp);
+            if (isEmoji && from < 0) {
+                from = i;
+            } else if (!isEmoji && from >= 0) {
+                as.addAttribute(TextAttribute.FONT, emojiFont, from, i);
+                from = -1;
+            }
+            i += Character.charCount(cp);
+        }
+        if (from >= 0) {
+            as.addAttribute(TextAttribute.FONT, emojiFont, from, text.length());
+        }
     }
 
     // ===== 用户配色 =====
@@ -185,7 +306,17 @@ public final class chatTheme {
                 g2.setColor(getModel().isPressed() || getModel().isRollover() ? hoverBg : bg);
                 g2.fill(new RoundRectangle2D.Float(0, 0, getWidth(), getHeight(), 10, 10));
                 g2.dispose();
-                super.paintComponent(g);
+                String btnText = getText();
+                if (btnText != null && containsEmoji(btnText)) {
+                    // 微软雅黑缺 emoji 字形，默认绘制会画成方框 []：
+                    // emoji 段用 emoji 字体、中文段用按钮字体，混合渲染
+                    Graphics2D textG2 = (Graphics2D) g.create();
+                    paintMixedText(textG2, btnText, getFont(), getEmojiFont(getFont().getSize()),
+                            getForeground(), getWidth() / 2, getHeight() / 2);
+                    textG2.dispose();
+                } else {
+                    super.paintComponent(g);
+                }
             }
         };
         button.setFont(new Font("Microsoft YaHei", Font.BOLD, 13));
@@ -221,6 +352,60 @@ public final class chatTheme {
             public void mouseExited(MouseEvent e) { button.setBackground(CARD_BG); }
         });
         return button;
+    }
+
+    /**
+     * 标题标签：「emoji + 中文」混合字体渲染的 JLabel。
+     * 纯中文文本时行为与普通 JLabel 完全一致；含 emoji 时按段用 emoji 字体绘制，
+     * 避免微软雅黑缺字形把 💬🔒 之类的符号画成方框。
+     */
+    public static class MixedTextLabel extends JLabel {
+        public MixedTextLabel(String text) {
+            super(text);
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            String text = getText();
+            if (text != null && containsEmoji(text)) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                paintMixedText(g2, text, getFont(), getEmojiFont(getFont().getSize()),
+                        getForeground(), getWidth() / 2, getHeight() / 2);
+                g2.dispose();
+            } else {
+                super.paintComponent(g);
+            }
+        }
+
+        @Override
+        public Dimension getPreferredSize() {
+            String text = getText();
+            if (text == null || !containsEmoji(text)) {
+                return super.getPreferredSize();
+            }
+            // JLabel 的默认宽度按单一字体（雅黑）度量：雅黑缺 emoji 字形，
+            // 算出的宽度与实际用 Segoe UI Emoji 渲染的宽度不一致，label 会被布局
+            // 系统算窄，自绘文本右缘被裁掉（“聊天室”显示不全）。按混合字体重新度量，
+            // 把差值补回宽度；高度取两种字体行高的较大值，防止垂直方向被裁。
+            Dimension d = super.getPreferredSize();
+            FontMetrics emojiFm = getFontMetrics(getEmojiFont(getFont().getSize()));
+            FontMetrics normalFm = getFontMetrics(getFont());
+            int mixedWidth = 0;
+            for (int i = 0; i < text.length(); ) {
+                int cp = text.codePointAt(i);
+                FontMetrics fm = isEmojiCodePoint(cp) ? emojiFm : normalFm;
+                mixedWidth += fm.charWidth(cp);
+                i += Character.charCount(cp);
+            }
+            d.width += mixedWidth - normalFm.stringWidth(text);
+            d.height = Math.max(d.height, Math.max(emojiFm.getHeight(), normalFm.getHeight()));
+            return d;
+        }
+    }
+
+    public static MixedTextLabel createMixedTextLabel(String text) {
+        return new MixedTextLabel(text);
     }
 
     /** 聊天输入框 */

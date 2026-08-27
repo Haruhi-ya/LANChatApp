@@ -16,6 +16,7 @@ import java.sql.SQLException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
@@ -338,6 +339,24 @@ public class chatServer {
                 handleGetAvatar(line.substring("GETAVATAR:".length()).trim());
             } else if (line.startsWith("SETAVATAR:")) {
                 handleSetAvatar(line.substring("SETAVATAR:".length()).trim());
+            } else if (line.startsWith("CHANGEPW:")) {
+                handleChangePassword(line.substring("CHANGEPW:".length()));
+            } else if (line.startsWith("SEARCHUSER:")) {
+                handleSearchUser(line.substring("SEARCHUSER:".length()));
+            } else if (line.startsWith("FRIENDREQ:")) {
+                handleFriendRequest(line.substring("FRIENDREQ:".length()).trim());
+            } else if (line.equals("FRIENDREQLIST")) {
+                handleFriendRequestList();
+            } else if (line.startsWith("FRIENDACCEPT:")) {
+                handleFriendAccept(line.substring("FRIENDACCEPT:".length()).trim());
+            } else if (line.startsWith("FRIENDREJECT:")) {
+                handleFriendReject(line.substring("FRIENDREJECT:".length()).trim());
+            } else if (line.equals("FRIENDLIST")) {
+                handleFriendList();
+            } else if (line.startsWith("FRIENDDEL:")) {
+                handleFriendDelete(line.substring("FRIENDDEL:".length()).trim());
+            } else if (line.startsWith("ADMINPMHIST:")) {
+                handleAdminPmHistory(line.substring("ADMINPMHIST:".length()));
             } else if (line.equals("LOGOUT")) {
                 disconnect(); // 主动退出，关闭连接后读取循环自然结束
             }
@@ -416,6 +435,50 @@ public class chatServer {
             broadcast("AVATARCHG:" + nickname);
             sendTo(this, "AVATAROK");
             log(nickname + " 更新了头像（" + data.length + " 字节）");
+        }
+
+        // ===== 修改密码 =====
+
+        /**
+         * 修改密码：CHANGEPW:旧密码:新密码。
+         * 与 LOGIN 同源切分：旧密码取首个冒号前（不含冒号），新密码取其后全部（可含冒号）。
+         * 已知限制：旧密码自身含冒号时无法通过本命令修改（与登录时解析密码同源问题，正常用户不受影响）。
+         * 校验旧密码正确后更新数据库，不强制重新登录——会话身份就是本连接的 nickname，密码只影响下次登录。
+         */
+        private void handleChangePassword(String rest) {
+            int colon = rest.indexOf(':');
+            if (colon < 0) {
+                sendTo(this, "CHANGEPWFAIL:修改密码格式错误");
+                return;
+            }
+            String oldPass = rest.substring(0, colon).trim();
+            String newPass = rest.substring(colon + 1).trim();
+            if (oldPass.isEmpty() || newPass.isEmpty()) {
+                sendTo(this, "CHANGEPWFAIL:密码不能为空");
+                return;
+            }
+            if (newPass.length() > 64) {
+                sendTo(this, "CHANGEPWFAIL:新密码过长（上限64个字符）");
+                return;
+            }
+            if (oldPass.equals(newPass)) {
+                sendTo(this, "CHANGEPWFAIL:新密码不能与旧密码相同");
+                return;
+            }
+            try {
+                int result = db.changePassword(nickname, oldPass, newPass);
+                if (result == dbManager.CHANGE_PASSWORD_OK) {
+                    sendTo(this, "CHANGEPWOK");
+                    log(nickname + " 修改了密码");
+                } else if (result == dbManager.CHANGE_PASSWORD_OLD_WRONG) {
+                    sendTo(this, "CHANGEPWFAIL:旧密码不正确");
+                } else {
+                    sendTo(this, "CHANGEPWFAIL:用户不存在或已注销");
+                }
+            } catch (SQLException e) {
+                System.err.println("修改密码失败：" + e.getMessage());
+                sendTo(this, "CHANGEPWFAIL:服务器内部错误，请稍后再试");
+            }
         }
 
         /**
@@ -512,8 +575,16 @@ public class chatServer {
                 sendTo(this, "SYSTEM:不能封禁自己");
                 return;
             }
+            // 封禁会删掉被 ban 者的好友关系（db.banUser 事务内），所以先在封禁前记下旧好友名单，
+            // 封禁后给在线的旧好友推送刷新后的好友列表快照，让他们的分组列表即时更新
+            List<String> oldFriends = Collections.emptyList();
             try {
-                // 事务：私聊记录和账号一起删，避免留下清不掉的孤儿行
+                oldFriends = db.getFriendList(target);
+            } catch (SQLException e) {
+                // 拿不到名单就不推，用户手动刷新也只是一次 FRIENDLIST
+            }
+            try {
+                // 事务：私聊记录、好友关系和账号一起删，避免留下清不掉的孤儿行
                 boolean deleted = db.banUser(target);
                 if (!deleted) {
                     sendTo(this, "SYSTEM:用户「" + target + "」不存在");
@@ -531,6 +602,12 @@ public class chatServer {
             }
             broadcast("SYSTEM:" + target + " 已被管理员 " + nickname + " 封禁（账号已删除）");
             broadcastOfflineUsers(); // 数据库变化，刷新离线用户列表
+            for (String f : oldFriends) {
+                ClientHandler h = clients.get(f);
+                if (h != null) {
+                    pushFriendList(h);
+                }
+            }
             log(nickname + " 封禁并删除用户 " + target);
         }
 
@@ -555,6 +632,14 @@ public class chatServer {
             try {
                 if (!db.userExists(target)) {
                     sendTo(this, "PMFAIL:" + target + ":用户「" + target + "」不存在或已注销");
+                    return false;
+                }
+                // 好友机制：私聊必须好友关系。
+                // 加在这里一处即可覆盖 PM / PMHIST / SEARCHPM 三条私聊路径；
+                // PMREAD / CLEARPM / PMRECALL 不校验（标记已读、清空自己的记录无隐私风险，
+                // 撤回有数据库层 sender 校验兜底，好友关系变化不影响撤回自己的消息）。
+                if (!db.isFriend(nickname, target)) {
+                    sendTo(this, "PMFAIL:" + target + ":你们还不是好友，请先添加好友");
                     return false;
                 }
             } catch (SQLException e) {
@@ -896,6 +981,251 @@ public class chatServer {
                 System.err.println("搜索私聊记录失败：" + e.getMessage());
                 sendTo(this, "SEARCHFAIL:" + target + ":服务器内部错误");
             }
+        }
+
+        // ===== 好友 =====
+
+        /**
+         * 向指定客户端推送好友列表快照：查库拼 FRIENDLIST:u1,u2,... 一行。
+         * 数据库操作只物化 List 就返回（见 dbManager 类注释），socket 写入在锁外。
+         */
+        private static void pushFriendList(ClientHandler client) {
+            try {
+                List<String> friends = db.getFriendList(client.nickname);
+                sendTo(client, "FRIENDLIST:" + String.join(",", friends));
+            } catch (SQLException e) {
+                System.err.println("推送好友列表失败：" + e.getMessage());
+            }
+        }
+
+        /** 向指定客户端回放待处理申请列表：FRIENDREQLISTBEGIN/ITEM:申请人/END（同 HIST 回放风格） */
+        private static void pushFriendRequestList(ClientHandler client) {
+            try {
+                List<String> froms = db.getFriendRequests(client.nickname);
+                sendTo(client, "FRIENDREQLISTBEGIN");
+                for (String from : froms) {
+                    sendTo(client, "FRIENDREQLISTITEM:" + from);
+                }
+                sendTo(client, "FRIENDREQLISTEND");
+            } catch (SQLException e) {
+                System.err.println("推送好友申请列表失败：" + e.getMessage());
+                sendTo(client, "FRIENDREQLISTBEGIN");
+                sendTo(client, "FRIENDREQLISTEND");
+            }
+        }
+
+        /** 按用户名模糊搜索用户：SEARCHUSER:关键词（排除自己，上限 20 条） */
+        private void handleSearchUser(String rest) {
+            String kw = rest.trim();
+            if (kw.isEmpty()) {
+                sendTo(this, "USERSEARCHFAIL:请输入关键词");
+                return;
+            }
+            if (kw.length() > MAX_SEARCH_KEYWORD_LEN) {
+                sendTo(this, "USERSEARCHFAIL:关键词过长");
+                return;
+            }
+            try {
+                List<String> names = db.searchUsers(kw, 20);
+                sendTo(this, "USERSEARCHBEGIN");
+                for (String name : names) {
+                    if (!name.equals(nickname)) { // 双保险：数据库层已按关键词查，这里排除自己
+                        sendTo(this, "USERSEARCHITEM:" + name);
+                    }
+                }
+                sendTo(this, "USERSEARCHEND");
+            } catch (SQLException e) {
+                System.err.println("搜索用户失败：" + e.getMessage());
+                sendTo(this, "USERSEARCHFAIL:服务器内部错误");
+            }
+        }
+
+        /**
+         * 发送好友申请：FRIENDREQ:目标。
+         * 目标在线则即时推送 FRIENDREQNEW；离线则其登录后通过 FRIENDREQLIST 补拉。
+         */
+        private void handleFriendRequest(String target) {
+            if (target.isEmpty() || !isValidName(target)) {
+                sendTo(this, "FRIENDREQFAIL:" + target + ":用户名不合法");
+                return;
+            }
+            if (target.equals(nickname)) {
+                sendTo(this, "FRIENDREQFAIL:" + target + ":不能添加自己为好友");
+                return;
+            }
+            try {
+                int result = db.sendFriendRequest(nickname, target);
+                switch (result) {
+                    case dbManager.FRIENDREQ_SENT:
+                        sendTo(this, "FRIENDREQOK:" + target);
+                        ClientHandler peer = clients.get(target);
+                        if (peer != null) {
+                            sendTo(peer, "FRIENDREQNEW:" + nickname);
+                        }
+                        log(nickname + " 向 " + target + " 发送了好友申请");
+                        break;
+                    case dbManager.FRIENDREQ_ALREADY_FRIEND:
+                        sendTo(this, "FRIENDREQFAIL:" + target + ":你们已经是好友了");
+                        break;
+                    case dbManager.FRIENDREQ_DUPLICATE:
+                        sendTo(this, "FRIENDREQFAIL:" + target + ":已发送过申请，请等待对方处理");
+                        break;
+                    default:
+                        sendTo(this, "FRIENDREQFAIL:" + target + ":用户「" + target + "」不存在或已注销");
+                }
+            } catch (SQLException e) {
+                System.err.println("发送好友申请失败：" + e.getMessage());
+                sendTo(this, "FRIENDREQFAIL:" + target + ":服务器内部错误，请稍后再试");
+            }
+        }
+
+        /** 拉取待处理申请列表：FRIENDREQLIST */
+        private void handleFriendRequestList() {
+            pushFriendRequestList(this);
+        }
+
+        /**
+         * 同意好友申请：FRIENDACCEPT:申请人。
+         * 双方在线都推 FRIENDLIST 快照 + FRIENDREQACK（申请方收到「申请已被同意」，同意方收到「已成为好友」）。
+         */
+        private void handleFriendAccept(String from) {
+            if (from.isEmpty() || !isValidName(from) || from.equals(nickname)) {
+                return;
+            }
+            try {
+                if (!db.acceptFriendRequest(nickname, from)) {
+                    sendTo(this, "FRIENDREQFAIL:" + from + ":该申请不存在或已被处理");
+                    return;
+                }
+            } catch (SQLException e) {
+                System.err.println("同意好友申请失败：" + e.getMessage());
+                sendTo(this, "FRIENDREQFAIL:" + from + ":服务器内部错误，请稍后再试");
+                return;
+            }
+            pushFriendList(this);
+            // 申请行已删，回放一次申请列表：客户端红点以回放为权威清零/重数
+            pushFriendRequestList(this);
+            sendTo(this, "FRIENDREQACK:" + from);
+            ClientHandler applicant = clients.get(from);
+            if (applicant != null) {
+                pushFriendList(applicant);
+                sendTo(applicant, "FRIENDREQACK:" + nickname);
+            }
+            log(nickname + " 同意了好友申请（" + from + "）");
+        }
+
+        /** 拒绝好友申请：FRIENDREJECT:申请人。申请方在线则推送 FRIENDREQDENIED（仅提示，可重新申请） */
+        private void handleFriendReject(String from) {
+            if (from.isEmpty() || !isValidName(from) || from.equals(nickname)) {
+                return;
+            }
+            try {
+                if (!db.rejectFriendRequest(nickname, from)) {
+                    sendTo(this, "FRIENDREQFAIL:" + from + ":该申请不存在或已被处理");
+                    return;
+                }
+            } catch (SQLException e) {
+                System.err.println("拒绝好友申请失败：" + e.getMessage());
+                sendTo(this, "FRIENDREQFAIL:" + from + ":服务器内部错误，请稍后再试");
+                return;
+            }
+            // 申请行已删，回放一次申请列表：客户端红点以回放为权威清零/重数
+            pushFriendRequestList(this);
+            ClientHandler applicant = clients.get(from);
+            if (applicant != null) {
+                sendTo(applicant, "FRIENDREQDENIED:" + nickname);
+            }
+            log(nickname + " 拒绝了 " + from + " 的好友申请");
+        }
+
+        /** 拉取好友列表：FRIENDLIST */
+        private void handleFriendList() {
+            pushFriendList(this);
+        }
+
+        /**
+         * 删除好友：FRIENDDEL:对方。自己回 FRIENDDELOK；对方在线推 FRIENDLIST 快照 + FRIENDDELETED。
+         * 双向都推 FRIENDLIST，保证双方侧边栏分组一致。
+         */
+        private void handleFriendDelete(String target) {
+            if (target.isEmpty() || !isValidName(target) || target.equals(nickname)) {
+                return;
+            }
+            try {
+                if (!db.removeFriend(nickname, target)) {
+                    sendTo(this, "FRIENDDELFAIL:你们不是好友");
+                    return;
+                }
+            } catch (SQLException e) {
+                System.err.println("删除好友失败：" + e.getMessage());
+                sendTo(this, "FRIENDDELFAIL:服务器内部错误，请稍后再试");
+                return;
+            }
+            sendTo(this, "FRIENDDELOK:" + target);
+            pushFriendList(this);
+            ClientHandler peer = clients.get(target);
+            if (peer != null) {
+                pushFriendList(peer);
+                sendTo(peer, "FRIENDDELETED:" + nickname);
+            }
+            log(nickname + " 删除了好友 " + target);
+        }
+
+        // ===== 管理员查看私聊 =====
+
+        /**
+         * 管理员查看两个用户之间的私聊记录：ADMINPMHIST:用户A:用户B。
+         * 只允许管理员；用户不存在直接报错；不校验好友关系（管理查看不受好友机制限制）。
+         * 内容走 ADMINPMHISTITEM:时间戳:发送者:内容（内容放最后可含冒号），时间戳 epoch 毫秒数字。
+         */
+        private void handleAdminPmHistory(String rest) {
+            if (!isAdmin()) {
+                sendTo(this, "ADMINPMFAIL:无权限执行此操作");
+                return;
+            }
+            int colon = rest.indexOf(':');
+            if (colon < 0) {
+                sendTo(this, "ADMINPMFAIL:查询格式错误");
+                return;
+            }
+            String u1 = rest.substring(0, colon).trim();
+            String u2 = rest.substring(colon + 1).trim();
+            if (!isValidName(u1) || !isValidName(u2)) {
+                sendTo(this, "ADMINPMFAIL:用户名不合法");
+                return;
+            }
+            if (u1.equals(u2)) {
+                sendTo(this, "ADMINPMFAIL:不能查询同一个人");
+                return;
+            }
+            try {
+                if (!db.userExists(u1)) {
+                    sendTo(this, "ADMINPMFAIL:用户「" + u1 + "」不存在或已注销");
+                    return;
+                }
+                if (!db.userExists(u2)) {
+                    sendTo(this, "ADMINPMFAIL:用户「" + u2 + "」不存在或已注销");
+                    return;
+                }
+            } catch (SQLException e) {
+                System.err.println("管理员查询用户存在性失败：" + e.getMessage());
+                sendTo(this, "ADMINPMFAIL:服务器内部错误");
+                return;
+            }
+            List<dbManager.ChatRecord> records;
+            try {
+                records = db.getPrivateConversation(u1, u2, dbManager.PRIVATE_HISTORY_LIMIT);
+            } catch (SQLException e) {
+                System.err.println("管理员查询私聊记录失败：" + e.getMessage());
+                sendTo(this, "ADMINPMFAIL:服务器内部错误");
+                return;
+            }
+            sendTo(this, "ADMINPMHISTBEGIN");
+            for (dbManager.ChatRecord r : records) {
+                sendTo(this, "ADMINPMHISTITEM:" + r.timestamp + ":" + r.sender + ":" + r.content);
+            }
+            sendTo(this, "ADMINPMHISTEND");
+            log(nickname + " 查看了 " + u1 + " 与 " + u2 + " 的私聊记录（" + records.size() + " 条）");
         }
 
         /** msgId 合法性：UUID 格式（8-4-4-4-12 的 hex + 连字符），防协议垃圾 */

@@ -88,6 +88,7 @@ public class dbManager {
 
         createMessageTables();
         migrateMessageTables();
+        createFriendTables();
     }
 
     /**
@@ -166,6 +167,36 @@ public class dbManager {
         }
     }
 
+    /**
+     * 创建好友关系表。
+     *
+     * Friendships 存规范化一份（user_a < user_b，字典序），不做 PrivateMessages 那种双份行——
+     * 好友关系是双向无视角的，双份行只会引入删不同步的负担。查询好友列表用
+     * WHERE user_a = ? OR user_b = ?。
+     *
+     * FriendRequests 存待处理申请（from_user -> to_user 单向）。UNIQUE(from_user, to_user)
+     * 挡住重复申请；拒绝即删行，因此拒绝后可以重新申请。
+     */
+    private void createFriendTables() throws SQLException {
+        try (Statement st = conn.createStatement()) {
+            st.executeUpdate("CREATE TABLE IF NOT EXISTS Friendships ("
+                    + "user_a VARCHAR(50) NOT NULL, "
+                    + "user_b VARCHAR(50) NOT NULL, "
+                    + "created_at BIGINT NOT NULL, "
+                    + "PRIMARY KEY (user_a, user_b), "
+                    + "INDEX idx_b (user_b)) "
+                    + "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+            st.executeUpdate("CREATE TABLE IF NOT EXISTS FriendRequests ("
+                    + "id BIGINT AUTO_INCREMENT PRIMARY KEY, "
+                    + "from_user VARCHAR(50) NOT NULL, "
+                    + "to_user VARCHAR(50) NOT NULL, "
+                    + "created_at BIGINT NOT NULL, "
+                    + "UNIQUE KEY uk_req (from_user, to_user)) "
+                    + "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        }
+    }
+
     /** 查询用户头像字节，未设置返回 null（与「设置过、图片恰为空」不冲突，存入时已拒绝空数据） */
     public synchronized byte[] getAvatar(String username) throws SQLException {
         String sql = "SELECT avatar FROM Users WHERE username = ?";
@@ -225,6 +256,19 @@ public class dbManager {
                 ps.setString(2, username);
                 ps.executeUpdate();
             }
+            // 好友关系与待处理申请一并清理（双向），不留指向已注销账号的幽灵好友/幽灵申请
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "DELETE FROM Friendships WHERE user_a = ? OR user_b = ?")) {
+                ps.setString(1, username);
+                ps.setString(2, username);
+                ps.executeUpdate();
+            }
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "DELETE FROM FriendRequests WHERE from_user = ? OR to_user = ?")) {
+                ps.setString(1, username);
+                ps.setString(2, username);
+                ps.executeUpdate();
+            }
             boolean deleted;
             try (PreparedStatement ps = conn.prepareStatement("DELETE FROM Users WHERE username = ?")) {
                 ps.setString(1, username);
@@ -267,6 +311,37 @@ public class dbManager {
         }
     }
 
+    // ===== 修改密码 =====
+
+    public static final int CHANGE_PASSWORD_OK = 0;
+    public static final int CHANGE_PASSWORD_OLD_WRONG = 1;
+    public static final int CHANGE_PASSWORD_USER_NOT_FOUND = 2;
+
+    /**
+     * 修改密码：先校验旧密码再更新（密码为明文存储，与注册一致）。
+     * 校验与更新放在同一个 synchronized 方法里，防止并发改密时旧密码校验与实际更新错位。
+     * 返回 CHANGE_PASSWORD_* 常量。
+     */
+    public synchronized int changePassword(String username, String oldPass, String newPass) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT password FROM Users WHERE username = ?")) {
+            ps.setString(1, username);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return CHANGE_PASSWORD_USER_NOT_FOUND;
+                }
+                if (!rs.getString("password").equals(oldPass)) {
+                    return CHANGE_PASSWORD_OLD_WRONG;
+                }
+            }
+        }
+        try (PreparedStatement ps = conn.prepareStatement("UPDATE Users SET password = ? WHERE username = ?")) {
+            ps.setString(1, newPass);
+            ps.setString(2, username);
+            ps.executeUpdate();
+        }
+        return CHANGE_PASSWORD_OK;
+    }
+
     /** 判断用户名是否已注册 */
     public synchronized boolean userExists(String username) throws SQLException {
         String sql = "SELECT 1 FROM Users WHERE username = ?";
@@ -288,6 +363,209 @@ public class dbManager {
             }
         }
         return names;
+    }
+
+    // ===== 好友 =====
+
+    public static final int FRIENDREQ_SENT = 0;             // 申请已入库
+    public static final int FRIENDREQ_ALREADY_FRIEND = 1;   // 已是好友
+    public static final int FRIENDREQ_DUPLICATE = 2;        // 已有待处理申请
+    public static final int FRIENDREQ_TARGET_NOT_FOUND = 3; // 目标用户不存在
+
+    /**
+     * 发送好友申请：一次 synchronized 调用内完成「目标存在 + 已是好友 + 插入」三个校验，
+     * 尽量少占用全局数据库锁（本类是单连接串行）。INSERT IGNORE 靠 UNIQUE 键挡重复申请。
+     * 返回 FRIENDREQ_* 常量。
+     */
+    public synchronized int sendFriendRequest(String from, String to) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT 1 FROM Users WHERE username = ?")) {
+            ps.setString(1, to);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return FRIENDREQ_TARGET_NOT_FOUND;
+                }
+            }
+        }
+        if (isFriend(from, to)) {
+            return FRIENDREQ_ALREADY_FRIEND;
+        }
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT IGNORE INTO FriendRequests(from_user, to_user, created_at) VALUES (?, ?, ?)")) {
+            ps.setString(1, from);
+            ps.setString(2, to);
+            ps.setLong(3, System.currentTimeMillis());
+            return ps.executeUpdate() > 0 ? FRIENDREQ_SENT : FRIENDREQ_DUPLICATE;
+        }
+    }
+
+    /** 读取 username 的待处理申请者列表（新的在前），用于登录补拉与列表回放 */
+    public synchronized List<String> getFriendRequests(String username) throws SQLException {
+        List<String> froms = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT from_user FROM FriendRequests WHERE to_user = ? ORDER BY id DESC")) {
+            ps.setString(1, username);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    froms.add(rs.getString("from_user"));
+                }
+            }
+        }
+        return froms;
+    }
+
+    /**
+     * 同意好友申请：事务内「删申请行 + 插好友行」，保证原子。
+     * 好友行写入前规范化 user_a < user_b；已是好友时 INSERT 撞主键，
+     * 捕获 SQLIntegrityConstraintViolationException 后仍算成功（申请行已删，关系已存在）。
+     * 返回 true 表示确实处理了一个申请（申请存在）。
+     */
+    public synchronized boolean acceptFriendRequest(String me, String from) throws SQLException {
+        conn.setAutoCommit(false);
+        try {
+            int deleted;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "DELETE FROM FriendRequests WHERE from_user = ? AND to_user = ?")) {
+                ps.setString(1, from);
+                ps.setString(2, me);
+                deleted = ps.executeUpdate();
+            }
+            if (deleted > 0) {
+                String a = me, b = from;
+                if (a.compareTo(b) > 0) {
+                    String t = a;
+                    a = b;
+                    b = t;
+                }
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO Friendships(user_a, user_b, created_at) VALUES (?, ?, ?)")) {
+                    ps.setString(1, a);
+                    ps.setString(2, b);
+                    ps.setLong(3, System.currentTimeMillis());
+                    try {
+                        ps.executeUpdate();
+                    } catch (SQLIntegrityConstraintViolationException e) {
+                        // 已是好友（重复接受）：申请行已删，关系已存在，视为处理成功
+                    }
+                }
+            }
+            conn.commit();
+            return deleted > 0;
+        } catch (SQLException e) {
+            conn.rollback();
+            throw e;
+        } finally {
+            conn.setAutoCommit(true);
+        }
+    }
+
+    /** 拒绝好友申请：删申请行。返回 true 表示确实拒绝了一个申请（拒绝后可重新申请） */
+    public synchronized boolean rejectFriendRequest(String me, String from) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "DELETE FROM FriendRequests WHERE from_user = ? AND to_user = ?")) {
+            ps.setString(1, from);
+            ps.setString(2, me);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    /** 删除好友：规范化存储只有一行，双向匹配删除。返回 true 表示确实删除了好友关系 */
+    public synchronized boolean removeFriend(String me, String peer) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "DELETE FROM Friendships WHERE (user_a = ? AND user_b = ?) OR (user_a = ? AND user_b = ?)")) {
+            ps.setString(1, me);
+            ps.setString(2, peer);
+            ps.setString(3, peer);
+            ps.setString(4, me);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    /** 判断 a、b 是否为好友（双向匹配） */
+    public synchronized boolean isFriend(String a, String b) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT 1 FROM Friendships WHERE (user_a = ? AND user_b = ?) OR (user_a = ? AND user_b = ?)")) {
+            ps.setString(1, a);
+            ps.setString(2, b);
+            ps.setString(3, b);
+            ps.setString(4, a);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    /** 读取 username 的全部好友，按用户名升序 */
+    public synchronized List<String> getFriendList(String username) throws SQLException {
+        List<String> friends = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT user_a, user_b FROM Friendships WHERE user_a = ? OR user_b = ?")) {
+            ps.setString(1, username);
+            ps.setString(2, username);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    friends.add(rs.getString("user_a").equals(username)
+                            ? rs.getString("user_b") : rs.getString("user_a"));
+                }
+            }
+        }
+        Collections.sort(friends);
+        return friends;
+    }
+
+    /** 按用户名模糊搜索已注册用户（排除自己由调用方过滤），供添加好友搜索弹窗使用 */
+    public synchronized List<String> searchUsers(String keyword, int limit) throws SQLException {
+        List<String> names = new ArrayList<>();
+        String kw = escapeLike(keyword);
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT username FROM Users WHERE username LIKE ? ESCAPE '\\\\' ORDER BY username LIMIT ?")) {
+            ps.setString(1, "%" + kw + "%");
+            ps.setInt(2, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    names.add(rs.getString("username"));
+                }
+            }
+        }
+        return names;
+    }
+
+    /**
+     * 管理员查询两个用户之间的完整私聊记录（双向合并，最近 limit 条，时间正序）。
+     *
+     * 双份行模型去重：同一条消息在库里有 owner=A 与 owner=B 两行（同 client_id、同 send_time、同 content）。
+     * 有 client_id 的行按 client_id 去重；老数据（client_id 为 NULL）按 (send_time, sender, content) 三元组去重。
+     * 先按 id 倒序取最近 limit 行，去重后反转成正序返回（便于直接顺序回放）。
+     */
+    public synchronized List<ChatRecord> getPrivateConversation(String u1, String u2, int limit)
+            throws SQLException {
+        List<ChatRecord> rows = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT sender, send_time, content, client_id FROM PrivateMessages "
+                        + "WHERE (`owner` = ? AND peer = ?) OR (`owner` = ? AND peer = ?) "
+                        + "ORDER BY id DESC LIMIT ?")) {
+            ps.setString(1, u1);
+            ps.setString(2, u2);
+            ps.setString(3, u2);
+            ps.setString(4, u1);
+            ps.setInt(5, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    rows.add(new ChatRecord(rs.getString("sender"), rs.getLong("send_time"),
+                            rs.getString("content"), rs.getString("client_id")));
+                }
+            }
+        }
+        // 去重：key = client_id（非空）或 时间|发送者|内容（老数据）。保留第一次出现的行（id 更大 = 更靠后的那条），两者内容一致
+        Map<String, ChatRecord> dedup = new LinkedHashMap<>();
+        for (ChatRecord r : rows) {
+            String key = (r.msgId != null && !r.msgId.isEmpty())
+                    ? "id:" + r.msgId
+                    : "raw:" + r.timestamp + "|" + r.sender + "|" + r.content;
+            dedup.putIfAbsent(key, r);
+        }
+        List<ChatRecord> result = new ArrayList<>(dedup.values());
+        Collections.reverse(result); // 倒序取回 -> 去重 -> 正序回放
+        return result;
     }
 
     // ===== 聊天记录 =====
